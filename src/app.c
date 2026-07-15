@@ -57,12 +57,26 @@ typedef struct App {
     const char *asset_path;
     time_t asset_modified;
     uint32_t asset_check_time;
+    float light_direction[3];
+    float light_update_time;
 } App;
 
 typedef struct ScenePushConstants {
     float mvp[16];
-    float model[16];
+    /* GLSL mat3 columns have vec4 alignment in a push-constant block. */
+    float model_rotation[12];
+    float light_direction[4];
 } ScenePushConstants;
+
+enum {
+    SCENE_VERTEX_PUSH_OFFSET = offsetof(ScenePushConstants, mvp),
+    SCENE_VERTEX_PUSH_SIZE = offsetof(ScenePushConstants, light_direction),
+    SCENE_LIGHT_PUSH_OFFSET = offsetof(ScenePushConstants, light_direction),
+    SCENE_LIGHT_PUSH_SIZE = sizeof(((ScenePushConstants *)0)->light_direction)
+};
+
+_Static_assert(sizeof(ScenePushConstants) == 128, "push constants must fit Vulkan's guaranteed minimum");
+_Static_assert(SCENE_LIGHT_PUSH_OFFSET == 112, "light direction must match the shader offset");
 
 static int vk_error(VkResult result, const char *operation)
 {
@@ -545,9 +559,16 @@ static int create_pipeline(App *app)
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .dynamicStateCount = 2, .pDynamicStates = dynamic_states};
-    VkPushConstantRange push_range = {.stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = sizeof(ScenePushConstants)};
+
+    /* The ranges occupy distinct bytes so updating the light cannot corrupt the matrices. */
+    VkPushConstantRange push_ranges[2] = {
+        {.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+         .offset = SCENE_VERTEX_PUSH_OFFSET, .size = SCENE_VERTEX_PUSH_SIZE},
+        {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .offset = SCENE_LIGHT_PUSH_OFFSET, .size = SCENE_LIGHT_PUSH_SIZE}
+    };
     VkPipelineLayoutCreateInfo layout_info = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .pushConstantRangeCount = 1, .pPushConstantRanges = &push_range};
+        .pushConstantRangeCount = 2, .pPushConstantRanges = push_ranges};
     result = vkCreatePipelineLayout(app->device, &layout_info, NULL, &app->pipeline_layout);
     if (result == VK_SUCCESS) {
         VkGraphicsPipelineCreateInfo pipeline_info = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -648,15 +669,50 @@ static int record_commands(App *app, uint32_t image_index, float seconds)
     vkCmdBindVertexBuffers(app->command_buffer, 0, 1, &app->vertex_buffer, &offset);
     vkCmdBindIndexBuffer(app->command_buffer, app->index_buffer, 0, VK_INDEX_TYPE_UINT32);
 
-    ScenePushConstants scene;
-    float view[16], projection[16], view_model[16];
-    mat4_rotation_y(scene.model, seconds * 0.45f);
+    ScenePushConstants scene = {0};
+    float model[16], view[16], projection[16], view_model[16];
+    mat4_rotation_y(model, seconds * 0.45f);
     mat4_view(view);
     mat4_perspective(projection, (float)app->extent.width / (float)app->extent.height);
-    mat4_multiply(view_model, view, scene.model);
+    mat4_multiply(view_model, view, model);
     mat4_multiply(scene.mvp, projection, view_model);
+
+    for (int column = 0; column < 3; ++column)
+        for (int row = 0; row < 3; ++row)
+            scene.model_rotation[column * 4 + row] = model[column * 4 + row];
+
+    /* Map the mouse position to a light direction and ease toward it. */
+    int mouse_x, mouse_y, window_width, window_height;
+    SDL_GetMouseState(&mouse_x, &mouse_y);
+    SDL_GetWindowSize(app->window, &window_width, &window_height);
+    float x = window_width > 1 ? 2.0f * mouse_x / (window_width - 1) - 1.0f : 0.0f;
+    float y = window_height > 1 ? 1.0f - 2.0f * mouse_y / (window_height - 1) : 0.0f;
+    x = fmaxf(-1.0f, fminf(1.0f, x));
+    y = fmaxf(-1.0f, fminf(1.0f, y));
+
+    const float azimuth = x * 2.35619449f;
+    const float elevation = y * 1.25663706f;
+    const float target[3] = {
+        sinf(azimuth) * cosf(elevation),
+        sinf(elevation),
+        cosf(azimuth) * cosf(elevation)
+    };
+    float delta = fminf(seconds - app->light_update_time, 0.1f);
+    float blend = 1.0f - expf(-8.0f * fmaxf(delta, 0.0f));
+    for (int i = 0; i < 3; ++i)
+        app->light_direction[i] += (target[i] - app->light_direction[i]) * blend;
+    float light_length = sqrtf(app->light_direction[0] * app->light_direction[0] +
+        app->light_direction[1] * app->light_direction[1] +
+        app->light_direction[2] * app->light_direction[2]);
+    scene.light_direction[0] = app->light_direction[0] / light_length;
+    scene.light_direction[1] = app->light_direction[1] / light_length;
+    scene.light_direction[2] = app->light_direction[2] / light_length;
+    app->light_update_time = seconds;
+
     vkCmdPushConstants(app->command_buffer, app->pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-        0, sizeof(scene), &scene);
+        SCENE_VERTEX_PUSH_OFFSET, SCENE_VERTEX_PUSH_SIZE, &scene);
+    vkCmdPushConstants(app->command_buffer, app->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+        SCENE_LIGHT_PUSH_OFFSET, SCENE_LIGHT_PUSH_SIZE, scene.light_direction);
     vkCmdDrawIndexed(app->command_buffer, app->index_count, 1, 0, 0, 0);
     vkCmdEndRenderPass(app->command_buffer);
     return vk_error(vkEndCommandBuffer(app->command_buffer), "end command buffer");
@@ -714,6 +770,7 @@ int app_run(const char *asset_path)
 {
     App app = {0};
     app.asset_path = asset_path ? asset_path : DEFAULT_OBJECT_PATH;
+    app.light_direction[2] = 1.0f;
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return EXIT_FAILURE;

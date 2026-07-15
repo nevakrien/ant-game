@@ -4,10 +4,14 @@ layout(location = 0) in vec3 normal;
 layout(location = 1) in vec3 world_position;
 layout(location = 0) out vec4 out_color;
 
+layout(push_constant) uniform Lighting {
+    layout(offset = 112) vec4 light_direction;
+} lighting;
+
 void main()
 {
     vec3 n = normalize(normal);
-    vec3 light_direction = normalize(vec3(-0.5, -0.7, 1.0));
+    vec3 light_direction = normalize(lighting.light_direction.xyz);
     float diffuse = max(dot(n, light_direction), 0.0);
     float rim = pow(1.0 - abs(dot(n, normalize(vec3(0.0, -6.0, 2.0) - world_position))), 3.0);
     vec3 copper = vec3(0.72, 0.25, 0.10);
