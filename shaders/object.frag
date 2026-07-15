@@ -6,6 +6,8 @@ layout(location = 0) out vec4 out_color;
 
 layout(push_constant) uniform Lighting {
     layout(offset = 64) vec4 light_direction;
+    layout(offset = 80) vec4 base_color;
+    layout(offset = 96) vec4 rim_color;
 } lighting;
 
 void main()
@@ -14,7 +16,7 @@ void main()
     vec3 light_direction = normalize(lighting.light_direction.xyz);
     float diffuse = max(dot(n, light_direction), 0.0);
     float rim = pow(1.0 - abs(dot(n, normalize(vec3(0.0, -6.0, 2.0) - world_position))), 3.0);
-    vec3 copper = vec3(0.72, 0.25, 0.10);
-    vec3 color = copper * (0.18 + 0.82 * diffuse) + vec3(0.35, 0.12, 0.05) * rim;
+    vec3 color = lighting.base_color.rgb * (0.28 + 0.72 * diffuse)
+        + lighting.rim_color.rgb * rim;
     out_color = vec4(color, 1.0);
 }

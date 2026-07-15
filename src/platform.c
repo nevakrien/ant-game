@@ -23,6 +23,12 @@ typedef struct PlatformMesh {
     uint32_t index_count;
 } PlatformMesh;
 
+typedef struct PlatformModel {
+    Model model;
+    uint32_t first_instance;
+    uint32_t instance_count;
+} PlatformModel;
+
 typedef struct GpuTransform {
     float rotation[4];
     float position[4];
@@ -47,7 +53,7 @@ typedef struct TransformRecord {
 } TransformRecord;
 
 typedef struct PlatformDrawable {
-    MeshHandle mesh_handle;
+    ModelHandle model_handle;
     TransformHandle transform_handle;
 } PlatformDrawable;
 
@@ -94,6 +100,9 @@ struct Platform {
     PlatformMesh *meshes;
     size_t mesh_count;
     size_t mesh_capacity;
+    PlatformModel *models;
+    size_t model_count;
+    size_t model_capacity;
     TransformRecord *transforms;
     size_t transform_count;
     size_t transform_capacity;
@@ -102,6 +111,9 @@ struct Platform {
     size_t drawable_capacity;
     VkBuffer transform_buffer;
     VkDeviceMemory transform_memory;
+    VkBuffer instance_buffer;
+    VkDeviceMemory instance_memory;
+    int instances_dirty;
     VkDescriptorSetLayout transform_descriptor_layout;
     VkDescriptorPool descriptor_pool;
     VkDescriptorSet transform_descriptor_set;
@@ -123,17 +135,23 @@ struct Platform {
 typedef struct PushConstants {
     float view_projection[16];
     float light_direction[4];
+    float base_color[4];
+    float rim_color[4];
 } PushConstants;
 
 enum {
     VIEW_PROJECTION_PUSH_OFFSET = offsetof(PushConstants, view_projection),
     VIEW_PROJECTION_PUSH_SIZE = sizeof(((PushConstants *)0)->view_projection),
     LIGHT_PUSH_OFFSET = offsetof(PushConstants, light_direction),
-    LIGHT_PUSH_SIZE = sizeof(((PushConstants *)0)->light_direction)
+    LIGHT_PUSH_SIZE = sizeof(((PushConstants *)0)->light_direction),
+    MODEL_PUSH_OFFSET = offsetof(PushConstants, base_color),
+    MODEL_PUSH_SIZE = sizeof(((PushConstants *)0)->base_color) +
+                      sizeof(((PushConstants *)0)->rim_color)
 };
 
-_Static_assert(sizeof(PushConstants) == 80, "push constants must fit Vulkan's guaranteed minimum");
+_Static_assert(sizeof(PushConstants) == 112, "push constants must fit Vulkan's guaranteed minimum");
 _Static_assert(LIGHT_PUSH_OFFSET == 64, "light direction must match the shader offset");
+_Static_assert(MODEL_PUSH_OFFSET == 80, "model colors must match the shader offset");
 _Static_assert(sizeof(GpuTransform) == 32, "transform must match std430");
 _Static_assert(sizeof(GpuTriangle) == 64, "triangle must match std430");
 _Static_assert(sizeof(GpuAnt) == 48, "ant must match std430");
@@ -352,6 +370,26 @@ int platform_update_mesh(Platform *app, MeshHandle mesh_handle, const ObjectMesh
     return 0;
 }
 
+int platform_add_model(Platform *app, const Model *model, ModelHandle *model_handle)
+{
+    if (!app || !model || !model_handle || model->mesh_handle >= app->mesh_count ||
+        app->model_count >= UINT32_MAX) return -1;
+    for (uint32_t i = 0; i < 3; ++i)
+        if (!isfinite(model->base_color[i]) || !isfinite(model->rim_color[i]) ||
+            model->base_color[i] < 0.0f || model->rim_color[i] < 0.0f) return -1;
+    if (app->model_count == app->model_capacity) {
+        size_t capacity = app->model_capacity ? app->model_capacity * 2 : 4;
+        PlatformModel *models = realloc(app->models, capacity * sizeof(*models));
+        if (!models) return -1;
+        app->models = models;
+        app->model_capacity = capacity;
+    }
+    *model_handle = (ModelHandle)app->model_count;
+    app->models[app->model_count++] = (PlatformModel){.model = *model};
+    app->instances_dirty = 1;
+    return 0;
+}
+
 int platform_add_transform(Platform *app, const Transform *transform,
                            TransformHandle *transform_handle)
 {
@@ -386,11 +424,11 @@ int platform_update_transform(Platform *app, TransformHandle transform_handle,
     return 0;
 }
 
-int platform_add_drawable(Platform *app, MeshHandle mesh_handle,
+int platform_add_drawable(Platform *app, ModelHandle model_handle,
                           TransformHandle transform_handle)
 {
-    if (!app || mesh_handle >= app->mesh_count ||
-        transform_handle >= app->transform_count || app->drawable_count >= UINT32_MAX) return -1;
+    if (!app || model_handle >= app->model_count ||
+        transform_handle >= app->transform_count || app->drawable_count >= MAX_TRANSFORMS) return -1;
     if (app->drawable_count == app->drawable_capacity) {
         size_t capacity = app->drawable_capacity ? app->drawable_capacity * 2 : 16;
         PlatformDrawable *drawables = realloc(app->drawables, capacity * sizeof(*drawables));
@@ -398,7 +436,8 @@ int platform_add_drawable(Platform *app, MeshHandle mesh_handle,
         app->drawables = drawables;
         app->drawable_capacity = capacity;
     }
-    app->drawables[app->drawable_count++] = (PlatformDrawable){mesh_handle, transform_handle};
+    app->drawables[app->drawable_count++] = (PlatformDrawable){model_handle, transform_handle};
+    app->instances_dirty = 1;
     return 0;
 }
 
@@ -786,25 +825,27 @@ static int read_shader(const char *name, uint32_t **code, size_t *size)
 
 static int create_transform_and_compute_resources(Platform *app)
 {
-    VkDescriptorSetLayoutBinding bindings[3] = {
+    VkDescriptorSetLayoutBinding bindings[4] = {
         {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT},
         {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
         {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT}
+         .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT}
     };
     VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 3, .pBindings = bindings
+        .bindingCount = 4, .pBindings = bindings
     };
     if (vk_error(vkCreateDescriptorSetLayout(app->device, &layout_info, NULL,
         &app->transform_descriptor_layout), "transform descriptor layout")) return -1;
 
     VkDescriptorPoolSize pool_size = {
         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 3 + MAX_ANT_SWARMS * 3
+        .descriptorCount = 4 + MAX_ANT_SWARMS * 4
     };
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -818,6 +859,9 @@ static int create_transform_and_compute_resources(Platform *app)
         (VkDeviceSize)MAX_TRANSFORMS * sizeof(GpuTransform);
     if (create_buffer(app, transform_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         NULL, &app->transform_buffer, &app->transform_memory)) return -1;
+    VkDeviceSize instance_buffer_size = (VkDeviceSize)MAX_TRANSFORMS * sizeof(uint32_t);
+    if (create_buffer(app, instance_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        NULL, &app->instance_buffer, &app->instance_memory)) return -1;
     VkDescriptorSetAllocateInfo set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = app->descriptor_pool, .descriptorSetCount = 1,
@@ -825,16 +869,21 @@ static int create_transform_and_compute_resources(Platform *app)
     };
     if (vk_error(vkAllocateDescriptorSets(app->device, &set_info,
         &app->transform_descriptor_set), "transform descriptor set")) return -1;
-    VkDescriptorBufferInfo transform_info = {
-        .buffer = app->transform_buffer, .offset = 0, .range = transform_buffer_size
+    VkDescriptorBufferInfo buffer_infos[2] = {
+        {.buffer = app->transform_buffer, .offset = 0, .range = transform_buffer_size},
+        {.buffer = app->instance_buffer, .offset = 0, .range = instance_buffer_size}
     };
-    VkWriteDescriptorSet transform_write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = app->transform_descriptor_set, .dstBinding = 0,
-        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &transform_info
+    VkWriteDescriptorSet writes[2] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = app->transform_descriptor_set, .dstBinding = 0,
+         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .pBufferInfo = &buffer_infos[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = app->transform_descriptor_set, .dstBinding = 3,
+         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .pBufferInfo = &buffer_infos[1]}
     };
-    vkUpdateDescriptorSets(app->device, 1, &transform_write, 0, NULL);
+    vkUpdateDescriptorSets(app->device, 2, writes, 0, NULL);
 
     VkPushConstantRange compute_push = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 32
@@ -926,7 +975,7 @@ static int create_pipeline(Platform *app)
          .offset = VIEW_PROJECTION_PUSH_OFFSET,
          .size = VIEW_PROJECTION_PUSH_SIZE},
         {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .offset = LIGHT_PUSH_OFFSET, .size = LIGHT_PUSH_SIZE}
+         .offset = LIGHT_PUSH_OFFSET, .size = LIGHT_PUSH_SIZE + MODEL_PUSH_SIZE}
     };
     VkPipelineLayoutCreateInfo layout_info = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &app->transform_descriptor_layout,
@@ -1032,6 +1081,30 @@ static int upload_dirty_transforms(Platform *app)
     return 0;
 }
 
+static int upload_model_instances(Platform *app)
+{
+    if (!app->instances_dirty) return 0;
+    uint32_t *instances = NULL;
+    VkDeviceSize size = (VkDeviceSize)app->drawable_count * sizeof(*instances);
+    if (size && vk_error(vkMapMemory(app->device, app->instance_memory, 0, size, 0,
+        (void **)&instances), "map model instances")) return -1;
+
+    uint32_t next_instance = 0;
+    for (size_t model_index = 0; model_index < app->model_count; ++model_index) {
+        PlatformModel *model = &app->models[model_index];
+        model->first_instance = next_instance;
+        for (size_t drawable_index = 0; drawable_index < app->drawable_count; ++drawable_index) {
+            const PlatformDrawable *drawable = &app->drawables[drawable_index];
+            if (drawable->model_handle == model_index)
+                instances[next_instance++] = drawable->transform_handle;
+        }
+        model->instance_count = next_instance - model->first_instance;
+    }
+    if (size) vkUnmapMemory(app->device, app->instance_memory);
+    app->instances_dirty = 0;
+    return 0;
+}
+
 static int record_commands(Platform *app, uint32_t image_index, const Scene *scene)
 {
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1092,14 +1165,21 @@ static int record_commands(Platform *app, uint32_t image_index, const Scene *sce
         VIEW_PROJECTION_PUSH_OFFSET, VIEW_PROJECTION_PUSH_SIZE, scene->view_projection);
     vkCmdPushConstants(app->command_buffer, app->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
         LIGHT_PUSH_OFFSET, LIGHT_PUSH_SIZE, scene->light_direction);
-    for (size_t i = 0; i < app->drawable_count; ++i) {
-        const PlatformDrawable *drawable = &app->drawables[i];
-        const PlatformMesh *mesh = &app->meshes[drawable->mesh_handle];
+    for (size_t i = 0; i < app->model_count; ++i) {
+        const PlatformModel *model = &app->models[i];
+        if (!model->instance_count) continue;
+        const PlatformMesh *mesh = &app->meshes[model->model.mesh_handle];
+        float colors[8] = {
+            model->model.base_color[0], model->model.base_color[1], model->model.base_color[2], 1.0f,
+            model->model.rim_color[0], model->model.rim_color[1], model->model.rim_color[2], 1.0f
+        };
+        vkCmdPushConstants(app->command_buffer, app->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+            MODEL_PUSH_OFFSET, MODEL_PUSH_SIZE, colors);
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(app->command_buffer, 0, 1, &mesh->vertex_buffer, &offset);
         vkCmdBindIndexBuffer(app->command_buffer, mesh->index_buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(app->command_buffer, mesh->index_count, 1, 0, 0,
-                         drawable->transform_handle);
+        vkCmdDrawIndexed(app->command_buffer, mesh->index_count, model->instance_count,
+                         0, 0, model->first_instance);
     }
     vkCmdEndRenderPass(app->command_buffer);
     return vk_error(vkEndCommandBuffer(app->command_buffer), "end command buffer");
@@ -1113,7 +1193,7 @@ int platform_draw(Platform *app, const Scene *scene)
     SDL_Vulkan_GetDrawableSize(app->window, &width, &height);
     if (width == 0 || height == 0) { SDL_Delay(20); return 0; }
     vkWaitForFences(app->device, 1, &app->frame_fence, VK_TRUE, UINT64_MAX);
-    if (upload_dirty_transforms(app)) return -1;
+    if (upload_dirty_transforms(app) || upload_model_instances(app)) return -1;
     uint32_t image_index;
     VkResult result = vkAcquireNextImageKHR(app->device, app->swapchain, UINT64_MAX,
         app->image_available, VK_NULL_HANDLE, &image_index);
@@ -1155,6 +1235,8 @@ static void cleanup(Platform *app)
         free(app->swarms);
         vkDestroyDescriptorPool(app->device, app->descriptor_pool, NULL);
         vkDestroyDescriptorSetLayout(app->device, app->transform_descriptor_layout, NULL);
+        vkDestroyBuffer(app->device, app->instance_buffer, NULL);
+        vkFreeMemory(app->device, app->instance_memory, NULL);
         vkDestroyBuffer(app->device, app->transform_buffer, NULL);
         vkFreeMemory(app->device, app->transform_memory, NULL);
         vkDestroyFence(app->device, app->frame_fence, NULL);
@@ -1163,6 +1245,7 @@ static void cleanup(Platform *app)
         vkDestroyCommandPool(app->device, app->command_pool, NULL);
         for (size_t i = 0; i < app->mesh_count; ++i) destroy_mesh(app, &app->meshes[i]);
         free(app->meshes);
+        free(app->models);
         free(app->drawables);
         free(app->transforms);
         vkDestroyDevice(app->device, NULL);

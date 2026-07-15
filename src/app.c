@@ -15,7 +15,8 @@
 typedef struct App {
     Platform *platform;
     MeshHandle teapot_mesh;
-    MeshHandle ant_mesh;
+    ModelHandle teapot_model;
+    ModelHandle ant_models[3];
     TransformHandle teapot_transforms[3];
     int mesh_loaded;
     const char *asset_path;
@@ -92,7 +93,7 @@ static float elapsed_seconds(const struct timespec *start)
     return (float)(now.tv_sec - start->tv_sec) + (float)(now.tv_nsec - start->tv_nsec) / 1000000000.0f;
 }
 
-static int create_ant_mesh(ObjectMesh *mesh)
+static int create_ant_mesh(ObjectMesh *mesh, uint32_t variant)
 {
     static const float centers[3][3] = {
         {0.0f, 0.022f, -0.045f},
@@ -112,6 +113,12 @@ static int create_ant_mesh(ObjectMesh *mesh)
         { 1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
         { 0,-1, 0}, { 0, 0, 1}, {0, 0,-1}
     };
+    static const float variant_scale[3][3] = {
+        {1.00f, 1.00f, 1.00f},
+        {0.82f, 0.90f, 1.25f},
+        {1.22f, 1.12f, 0.86f}
+    };
+    if (variant >= 3) return -1;
     memset(mesh, 0, sizeof(*mesh));
     mesh->vertex_count = 18;
     mesh->index_count = 72;
@@ -127,6 +134,7 @@ static int create_ant_mesh(ObjectMesh *mesh)
             for (uint32_t axis = 0; axis < 3; ++axis) {
                 out->position[axis] = centers[body][axis]
                     + directions[vertex][axis] * radii[body][axis];
+                out->position[axis] *= variant_scale[variant][axis];
                 out->normal[axis] = directions[vertex][axis];
             }
         }
@@ -139,21 +147,42 @@ static int create_ant_mesh(ObjectMesh *mesh)
 static int add_ant_swarms(App *app)
 {
     ObjectMesh source = {0};
-    ObjectMesh ant_mesh = {0};
     ObjectNavMesh navmesh = {0};
     if (object_mesh_load_obj_file(app->asset_path, &source) ||
-        object_navmesh_build(&source, &navmesh) || create_ant_mesh(&ant_mesh)) {
+        object_navmesh_build(&source, &navmesh)) {
         object_mesh_destroy(&source);
         object_navmesh_destroy(&navmesh);
-        object_mesh_destroy(&ant_mesh);
         return -1;
     }
-    if (platform_add_mesh(app->platform, &ant_mesh, &app->ant_mesh)) {
-        object_navmesh_destroy(&navmesh);
+    object_mesh_destroy(&source);
+    static const float base_colors[3][3] = {
+        {0.95f, 0.22f, 0.08f},
+        {0.98f, 0.72f, 0.12f},
+        {0.18f, 0.82f, 0.72f}
+    };
+    static const float rim_colors[3][3] = {
+        {0.90f, 0.35f, 0.12f},
+        {1.00f, 0.90f, 0.35f},
+        {0.35f, 1.00f, 0.90f}
+    };
+    for (uint32_t variant = 0; variant < 3; ++variant) {
+        ObjectMesh ant_mesh = {0};
+        MeshHandle mesh_handle;
+        if (create_ant_mesh(&ant_mesh, variant) ||
+            platform_add_mesh(app->platform, &ant_mesh, &mesh_handle)) {
+            object_mesh_destroy(&ant_mesh);
+            object_navmesh_destroy(&navmesh);
+            return -1;
+        }
         object_mesh_destroy(&ant_mesh);
-        return -1;
+        Model model = {.mesh_handle = mesh_handle};
+        memcpy(model.base_color, base_colors[variant], sizeof(model.base_color));
+        memcpy(model.rim_color, rim_colors[variant], sizeof(model.rim_color));
+        if (platform_add_model(app->platform, &model, &app->ant_models[variant])) {
+            object_navmesh_destroy(&navmesh);
+            return -1;
+        }
     }
-    object_mesh_destroy(&ant_mesh);
 
     uint32_t triangle_count = navmesh.mesh.index_count / 3;
     for (uint32_t surface = 0; surface < 3; ++surface) {
@@ -191,7 +220,8 @@ static int add_ant_swarms(App *app)
             ants[i].speed = 0.18f + 0.06f * (float)(i % 7) / 6.0f;
             Transform transform = {.rotation = {0.0f, 0.0f, 0.0f, 1.0f}};
             if (platform_add_transform(app->platform, &transform, &ants[i].transform_handle) ||
-                platform_add_drawable(app->platform, app->ant_mesh, ants[i].transform_handle)) {
+                platform_add_drawable(app->platform, app->ant_models[(i + surface) % 3],
+                                      ants[i].transform_handle)) {
                 object_navmesh_destroy(&navmesh);
                 return -1;
             }
@@ -217,7 +247,15 @@ static int load_mesh(App *app)
     if (app->mesh_loaded) result = platform_update_mesh(app->platform, app->teapot_mesh, &mesh);
     else {
         result = platform_add_mesh(app->platform, &mesh, &app->teapot_mesh);
-        if (!result) app->mesh_loaded = 1;
+        if (!result) {
+            Model model = {
+                .mesh_handle = app->teapot_mesh,
+                .base_color = {0.72f, 0.25f, 0.10f},
+                .rim_color = {0.35f, 0.12f, 0.05f}
+            };
+            result = platform_add_model(app->platform, &model, &app->teapot_model);
+            if (!result) app->mesh_loaded = 1;
+        }
     }
     object_mesh_destroy(&mesh);
     return result;
@@ -278,7 +316,7 @@ int app_run(const char *asset_path)
         transform.rotation[3] = cosf(half_angle);
         memcpy(transform.position, TEAPOT_POSITIONS[i], sizeof(transform.position));
         if (platform_add_transform(app.platform, &transform, &app.teapot_transforms[i]) ||
-            platform_add_drawable(app.platform, app.teapot_mesh, app.teapot_transforms[i])) {
+            platform_add_drawable(app.platform, app.teapot_model, app.teapot_transforms[i])) {
             platform_destroy(app.platform);
             return EXIT_FAILURE;
         }

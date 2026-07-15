@@ -12,6 +12,10 @@ layout(std430, set = 0, binding = 0) readonly buffer Transforms {
     Transform transforms[];
 };
 
+layout(std430, set = 0, binding = 3) readonly buffer Instances {
+    uint transform_ids[];
+};
+
 layout(push_constant) uniform Scene {
     mat4 view_projection;
 } scene;
@@ -21,7 +25,7 @@ layout(location = 1) out vec3 world_position;
 
 void main()
 {
-    Transform transform = transforms[gl_InstanceIndex];
+    Transform transform = transforms[transform_ids[gl_InstanceIndex]];
     float rotation_length = length(transform.rotation);
     vec4 q = rotation_length > 0.0
         ? transform.rotation / rotation_length
