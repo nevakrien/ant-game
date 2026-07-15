@@ -5,7 +5,7 @@ layout(location = 1) in vec3 world_position;
 layout(location = 0) out vec4 out_color;
 
 layout(push_constant) uniform Lighting {
-    layout(offset = 96) vec4 light_direction;
+    layout(offset = 64) vec4 light_direction;
 } lighting;
 
 void main()

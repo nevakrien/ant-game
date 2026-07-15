@@ -1,0 +1,190 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+struct Transform {
+    vec4 rotation;
+    vec4 position;
+};
+
+struct Triangle {
+    vec4 vertices[3];
+    uvec4 neighbors;
+};
+
+struct Ant {
+    uvec4 data;
+    vec4 position_speed;
+    vec4 tangent;
+};
+
+layout(std430, set = 0, binding = 0) buffer Transforms {
+    Transform transforms[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Triangles {
+    Triangle triangles[];
+};
+
+layout(std430, set = 0, binding = 2) buffer Ants {
+    Ant ants[];
+};
+
+layout(push_constant) uniform Update {
+    float delta_seconds;
+    float surface_offset;
+    uint ant_count;
+    uint triangle_count;
+    uint surface_transform;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+} update;
+
+vec3 rotate_vector(vec4 q, vec3 value)
+{
+    return value + 2.0 * cross(q.xyz, cross(q.xyz, value) + q.w * value);
+}
+
+vec4 quaternion_from_basis(vec3 x, vec3 y, vec3 z)
+{
+    float trace = x.x + y.y + z.z;
+    vec4 q;
+    if (trace > 0.0) {
+        float s = sqrt(trace + 1.0) * 2.0;
+        q = vec4((y.z - z.y) / s, (z.x - x.z) / s,
+                 (x.y - y.x) / s, 0.25 * s);
+    } else if (x.x > y.y && x.x > z.z) {
+        float s = sqrt(1.0 + x.x - y.y - z.z) * 2.0;
+        q = vec4(0.25 * s, (x.y + y.x) / s,
+                 (x.z + z.x) / s, (y.z - z.y) / s);
+    } else if (y.y > z.z) {
+        float s = sqrt(1.0 + y.y - x.x - z.z) * 2.0;
+        q = vec4((x.y + y.x) / s, 0.25 * s,
+                 (y.z + z.y) / s, (z.x - x.z) / s);
+    } else {
+        float s = sqrt(1.0 + z.z - x.x - y.y) * 2.0;
+        q = vec4((x.z + z.x) / s, (y.z + z.y) / s,
+                 0.25 * s, (x.y - y.x) / s);
+    }
+    return normalize(q);
+}
+
+vec3 barycentric(vec3 point, vec3 a, vec3 b, vec3 c)
+{
+    vec3 v0 = b - a;
+    vec3 v1 = c - a;
+    vec3 v2 = point - a;
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float denominator = d00 * d11 - d01 * d01;
+    if (abs(denominator) < 1e-12) return vec3(-1.0);
+    float v = (d11 * dot(v2, v0) - d01 * dot(v2, v1)) / denominator;
+    float w = (d00 * dot(v2, v1) - d01 * dot(v2, v0)) / denominator;
+    return vec3(1.0 - v - w, v, w);
+}
+
+vec3 rotate_around_axis(vec3 value, vec3 axis, float angle)
+{
+    float cosine = cos(angle);
+    return value * cosine + cross(axis, value) * sin(angle)
+        + axis * dot(axis, value) * (1.0 - cosine);
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= update.ant_count) return;
+
+    Ant ant = ants[index];
+    if (ant.data.y >= update.triangle_count) return;
+
+    vec3 direction = normalize(ant.tangent.xyz);
+    vec3 position = ant.position_speed.xyz;
+    float distance_left = ant.position_speed.w * max(update.delta_seconds, 0.0) + ant.tangent.w;
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+
+    for (uint crossing = 0; crossing < 16 && distance_left > 1e-6; ++crossing) {
+        Triangle triangle = triangles[ant.data.y];
+        vec3 a = triangle.vertices[0].xyz;
+        vec3 b = triangle.vertices[1].xyz;
+        vec3 c = triangle.vertices[2].xyz;
+        normal = normalize(cross(b - a, c - a));
+        direction = normalize(direction - normal * dot(direction, normal));
+
+        vec3 start = position - normal * dot(position - a, normal);
+        vec3 end = start + direction * distance_left;
+        vec3 from = barycentric(start, a, b, c);
+        vec3 to = barycentric(end, a, b, c);
+        if (min(to.x, min(to.y, to.z)) >= -1e-5) {
+            position = end;
+            distance_left = 0.0;
+            break;
+        }
+
+        float fraction = 1.0;
+        uint edge = 0;
+        const uint opposite[3] = uint[3](2, 0, 1);
+        for (uint candidate = 0; candidate < 3; ++candidate) {
+            uint component = opposite[candidate];
+            if (to[component] < -1e-5) {
+                float denominator = from[component] - to[component];
+                float hit = denominator > 1e-8 ? from[component] / denominator : 1.0;
+                if (hit < fraction) {
+                    fraction = max(hit, 0.0);
+                    edge = candidate;
+                }
+            }
+        }
+
+        position = mix(start, end, fraction);
+        distance_left *= 1.0 - fraction;
+        uint neighbor = triangle.neighbors[edge];
+        vec3 edge_start = triangle.vertices[edge].xyz;
+        vec3 edge_end = triangle.vertices[(edge + 1) % 3].xyz;
+        vec3 edge_axis = normalize(edge_end - edge_start);
+
+        if (neighbor == 0xffffffffu || neighbor >= update.triangle_count) {
+            vec3 inward = cross(normal, edge_axis);
+            vec3 opposite_vertex = triangle.vertices[(edge + 2) % 3].xyz;
+            if (dot(inward, opposite_vertex - edge_start) < 0.0) inward = -inward;
+            direction = normalize(direction - 2.0 * inward * dot(direction, inward));
+            position += inward * 1e-5;
+            continue;
+        }
+
+        Triangle next_triangle = triangles[neighbor];
+        vec3 next_normal = normalize(cross(next_triangle.vertices[1].xyz - next_triangle.vertices[0].xyz,
+                                           next_triangle.vertices[2].xyz - next_triangle.vertices[0].xyz));
+        float angle = atan(dot(edge_axis, cross(normal, next_normal)), dot(normal, next_normal));
+        direction = rotate_around_axis(direction, edge_axis, angle);
+        direction = normalize(direction - next_normal * dot(direction, next_normal));
+        normal = next_normal;
+        ant.data.y = neighbor;
+        position += direction * 1e-5;
+    }
+
+    Triangle final_triangle = triangles[ant.data.y];
+    normal = normalize(cross(final_triangle.vertices[1].xyz - final_triangle.vertices[0].xyz,
+                             final_triangle.vertices[2].xyz - final_triangle.vertices[0].xyz));
+    direction = normalize(direction - normal * dot(direction, normal));
+    vec3 right = normalize(cross(normal, direction));
+    vec4 local_rotation = quaternion_from_basis(right, normal, direction);
+    Transform surface = transforms[update.surface_transform];
+    vec4 surface_rotation = length(surface.rotation) > 0.0
+        ? normalize(surface.rotation) : vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 world_rotation = vec4(
+        surface_rotation.w * local_rotation.xyz + local_rotation.w * surface_rotation.xyz
+            + cross(surface_rotation.xyz, local_rotation.xyz),
+        surface_rotation.w * local_rotation.w - dot(surface_rotation.xyz, local_rotation.xyz));
+    Transform transform;
+    transform.rotation = normalize(world_rotation);
+    transform.position = vec4(surface.position.xyz
+        + rotate_vector(surface_rotation, position + normal * update.surface_offset), 1.0);
+    transforms[ant.data.x] = transform;
+    ant.position_speed.xyz = position;
+    ant.tangent.xyz = direction;
+    ant.tangent.w = distance_left;
+    ants[index] = ant;
+}

@@ -30,20 +30,35 @@ Pass another OBJ as the first argument to render a Blender export:
 ./build/vulkan_teapot path/to/model.obj
 ```
 
-Three instances of the teapot rotate automatically. The OBJ file's modification time is checked
-twice per second and successfully saved changes are hot reloaded. Resize or
-maximize the window to exercise swapchain recreation; press Escape to exit.
+Three instances of the teapot rotate automatically, each carrying a GPU-driven
+swarm of ants. Resize or maximize the window to exercise swapchain recreation;
+press Escape to exit.
 
-## Drawing objects
+## Drawing meshes
 
 Meshes are uploaded once with `platform_add_mesh()` and kept in the renderer's
-mesh registry. It returns a stable `PlatformMeshIndex` that can be reused by any
-number of `PlatformObject` entries. Each object contains only that mesh index, a
-quaternion in `x, y, z, w` order, and a position. A zero quaternion is treated
-as the identity rotation. Pass the frame's object array
-to `platform_draw()`; the renderer binds each stored mesh and issues one
-`vkCmdDrawIndexed()` call per object. `platform_update_mesh()` replaces an
-uploaded mesh without invalidating its index.
+mesh registry. Transforms are stored separately with `platform_add_transform()`
+and updated with `platform_update_transform()`. `platform_add_drawable()` pairs
+a mesh handle with a transform handle for rendering. This keeps mesh selection
+out of simulation-facing transform handles while still letting multiple meshes
+share one transform. Transforms live in one GPU storage buffer, and a zero
+quaternion is treated as the identity rotation.
+
+## Antable objects
+
+`platform_add_antable()` associates one surface transform with a navmesh and a
+buffer of compact ant tokens. The container stores the surface handle and
+navmesh once. Each token contains only its rendered transform handle, current
+triangle, speed, navmesh-local position, and tangent. `platform_step_ants()`
+queues elapsed time for the next draw. Before the render pass, the ant compute
+shader traverses triangle neighbors, parallel-transports each tangent across
+folds, composes the local ant pose with the current surface transform, and
+writes the ant's normal transform. Consequently, ants follow moving and
+rotating surface instances without a separate ant graphics pipeline.
+
+A future world-space token container can hold free-moving ants. Token transfer
+between that container and an antable would provide explicit attach and detach
+behavior without making every surface token carry a parent or navmesh handle.
 
 ## OBJ loader
 

@@ -15,7 +15,7 @@ include(CTest)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 
-foreach(shader object.vert object.frag)
+foreach(shader object.vert object.frag ant.comp)
     add_custom_command(
         OUTPUT "${SHADER_OUTPUT_DIR}/${shader}.spv"
         COMMAND "${GLSLANG_VALIDATOR}" -V

@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,51 @@ typedef struct PlatformMesh {
     VkDeviceMemory index_memory;
     uint32_t index_count;
 } PlatformMesh;
+
+typedef struct GpuTransform {
+    float rotation[4];
+    float position[4];
+} GpuTransform;
+
+typedef struct GpuTriangle {
+    float vertices[3][4];
+    uint32_t neighbors[4];
+} GpuTriangle;
+
+typedef struct GpuAnt {
+    uint32_t data[4];
+    float position_speed[4];
+    float tangent[4];
+} GpuAnt;
+
+typedef struct TransformRecord {
+    Transform transform;
+    int dirty;
+    int ant_owned;
+    int ant_surface;
+} TransformRecord;
+
+typedef struct PlatformDrawable {
+    MeshHandle mesh_handle;
+    TransformHandle transform_handle;
+} PlatformDrawable;
+
+typedef struct AntSwarm {
+    VkBuffer triangle_buffer;
+    VkDeviceMemory triangle_memory;
+    VkBuffer ant_buffer;
+    VkDeviceMemory ant_memory;
+    VkDescriptorSet descriptor_set;
+    uint32_t triangle_count;
+    uint32_t ant_count;
+    TransformHandle surface_transform;
+} AntSwarm;
+
+enum {
+    MAX_TRANSFORMS = 65536,
+    MAX_ANT_SWARMS = 1024,
+    ANT_WORKGROUP_SIZE = 64
+};
 
 struct Platform {
     SDL_Window *window;
@@ -48,6 +94,24 @@ struct Platform {
     PlatformMesh *meshes;
     size_t mesh_count;
     size_t mesh_capacity;
+    TransformRecord *transforms;
+    size_t transform_count;
+    size_t transform_capacity;
+    PlatformDrawable *drawables;
+    size_t drawable_count;
+    size_t drawable_capacity;
+    VkBuffer transform_buffer;
+    VkDeviceMemory transform_memory;
+    VkDescriptorSetLayout transform_descriptor_layout;
+    VkDescriptorPool descriptor_pool;
+    VkDescriptorSet transform_descriptor_set;
+    VkPipelineLayout compute_pipeline_layout;
+    VkPipeline compute_pipeline;
+    AntSwarm *swarms;
+    size_t swarm_count;
+    size_t swarm_capacity;
+    float swarm_delta_seconds;
+    int ants_need_dispatch;
     VkCommandPool command_pool;
     VkCommandBuffer command_buffer;
     VkSemaphore image_available;
@@ -58,23 +122,21 @@ struct Platform {
 
 typedef struct PushConstants {
     float view_projection[16];
-    float rotation[4];
-    float position[4];
     float light_direction[4];
 } PushConstants;
 
 enum {
     VIEW_PROJECTION_PUSH_OFFSET = offsetof(PushConstants, view_projection),
     VIEW_PROJECTION_PUSH_SIZE = sizeof(((PushConstants *)0)->view_projection),
-    OBJECT_PUSH_OFFSET = offsetof(PushConstants, rotation),
-    OBJECT_PUSH_SIZE = sizeof(((PushConstants *)0)->rotation) + sizeof(((PushConstants *)0)->position),
     LIGHT_PUSH_OFFSET = offsetof(PushConstants, light_direction),
     LIGHT_PUSH_SIZE = sizeof(((PushConstants *)0)->light_direction)
 };
 
-_Static_assert(sizeof(PushConstants) == 112, "push constants must fit Vulkan's guaranteed minimum");
-_Static_assert(OBJECT_PUSH_OFFSET == 64, "object transform must match the shader offset");
-_Static_assert(LIGHT_PUSH_OFFSET == 96, "light direction must match the shader offset");
+_Static_assert(sizeof(PushConstants) == 80, "push constants must fit Vulkan's guaranteed minimum");
+_Static_assert(LIGHT_PUSH_OFFSET == 64, "light direction must match the shader offset");
+_Static_assert(sizeof(GpuTransform) == 32, "transform must match std430");
+_Static_assert(sizeof(GpuTriangle) == 64, "triangle must match std430");
+_Static_assert(sizeof(GpuAnt) == 48, "ant must match std430");
 
 static int vk_error(VkResult result, const char *operation)
 {
@@ -141,7 +203,8 @@ static int find_queue_families(Platform *app, VkPhysicalDevice device)
     for (uint32_t i = 0; i < count; ++i) {
         VkBool32 supported = VK_FALSE;
         vkGetPhysicalDeviceSurfaceSupportKHR(device, i, app->surface, &supported);
-        if ((properties[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && graphics == UINT32_MAX) graphics = i;
+        if ((properties[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+            (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT) && graphics == UINT32_MAX) graphics = i;
         if (supported && present == UINT32_MAX) present = i;
     }
     free(properties);
@@ -167,7 +230,7 @@ static int create_device(Platform *app)
     }
     free(devices);
     if (app->physical_device == VK_NULL_HANDLE) {
-        fprintf(stderr, "No Vulkan GPU with presentation support was found\n");
+        fprintf(stderr, "No Vulkan GPU with graphics, compute, and presentation support was found\n");
         return -1;
     }
 
@@ -228,7 +291,8 @@ static int create_buffer(Platform *app, VkDeviceSize size, VkBufferUsageFlags us
     if (vk_error(vkBindBufferMemory(app->device, *buffer, *memory, 0), "vkBindBufferMemory")) return -1;
     void *mapped = NULL;
     if (vk_error(vkMapMemory(app->device, *memory, 0, size, 0, &mapped), "vkMapMemory")) return -1;
-    memcpy(mapped, data, (size_t)size);
+    if (data) memcpy(mapped, data, (size_t)size);
+    else memset(mapped, 0, (size_t)size);
     vkUnmapMemory(app->device, *memory);
     return 0;
 }
@@ -257,9 +321,9 @@ static int create_mesh(Platform *app, const ObjectMesh *source, PlatformMesh *me
     return result;
 }
 
-int platform_add_mesh(Platform *app, const ObjectMesh *source, PlatformMeshIndex *mesh_index)
+int platform_add_mesh(Platform *app, const ObjectMesh *source, MeshHandle *mesh_handle)
 {
-    if (!app || !mesh_index || app->mesh_count >= UINT32_MAX) return -1;
+    if (!app || !mesh_handle || app->mesh_count >= UINT32_MAX) return -1;
     PlatformMesh mesh;
     if (create_mesh(app, source, &mesh)) return -1;
     if (app->mesh_count == app->mesh_capacity) {
@@ -272,20 +336,296 @@ int platform_add_mesh(Platform *app, const ObjectMesh *source, PlatformMeshIndex
         app->meshes = meshes;
         app->mesh_capacity = capacity;
     }
-    *mesh_index = (PlatformMeshIndex)app->mesh_count;
+    *mesh_handle = (MeshHandle)app->mesh_count;
     app->meshes[app->mesh_count++] = mesh;
     return 0;
 }
 
-int platform_update_mesh(Platform *app, PlatformMeshIndex mesh_index, const ObjectMesh *source)
+int platform_update_mesh(Platform *app, MeshHandle mesh_handle, const ObjectMesh *source)
 {
-    if (!app || mesh_index >= app->mesh_count) return -1;
+    if (!app || mesh_handle >= app->mesh_count) return -1;
     PlatformMesh mesh;
     if (create_mesh(app, source, &mesh)) return -1;
     vkDeviceWaitIdle(app->device);
-    destroy_mesh(app, &app->meshes[mesh_index]);
-    app->meshes[mesh_index] = mesh;
+    destroy_mesh(app, &app->meshes[mesh_handle]);
+    app->meshes[mesh_handle] = mesh;
     return 0;
+}
+
+int platform_add_transform(Platform *app, const Transform *transform,
+                           TransformHandle *transform_handle)
+{
+    if (!app || !transform || !transform_handle ||
+        app->transform_count >= MAX_TRANSFORMS) return -1;
+    for (uint32_t i = 0; i < 3; ++i)
+        if (!isfinite(transform->position[i]) || !isfinite(transform->rotation[i])) return -1;
+    if (!isfinite(transform->rotation[3])) return -1;
+    if (app->transform_count == app->transform_capacity) {
+        size_t capacity = app->transform_capacity ? app->transform_capacity * 2 : 16;
+        TransformRecord *transforms = realloc(app->transforms, capacity * sizeof(*transforms));
+        if (!transforms) return -1;
+        app->transforms = transforms;
+        app->transform_capacity = capacity;
+    }
+    *transform_handle = (TransformHandle)app->transform_count;
+    app->transforms[app->transform_count++] =
+        (TransformRecord){.transform = *transform, .dirty = 1};
+    return 0;
+}
+
+int platform_update_transform(Platform *app, TransformHandle transform_handle,
+                              const Transform *transform)
+{
+    if (!app || !transform || transform_handle >= app->transform_count) return -1;
+    if (app->transforms[transform_handle].ant_owned) return -1;
+    for (uint32_t i = 0; i < 3; ++i)
+        if (!isfinite(transform->position[i]) || !isfinite(transform->rotation[i])) return -1;
+    if (!isfinite(transform->rotation[3])) return -1;
+    app->transforms[transform_handle].transform = *transform;
+    app->transforms[transform_handle].dirty = 1;
+    return 0;
+}
+
+int platform_add_drawable(Platform *app, MeshHandle mesh_handle,
+                          TransformHandle transform_handle)
+{
+    if (!app || mesh_handle >= app->mesh_count ||
+        transform_handle >= app->transform_count || app->drawable_count >= UINT32_MAX) return -1;
+    if (app->drawable_count == app->drawable_capacity) {
+        size_t capacity = app->drawable_capacity ? app->drawable_capacity * 2 : 16;
+        PlatformDrawable *drawables = realloc(app->drawables, capacity * sizeof(*drawables));
+        if (!drawables) return -1;
+        app->drawables = drawables;
+        app->drawable_capacity = capacity;
+    }
+    app->drawables[app->drawable_count++] = (PlatformDrawable){mesh_handle, transform_handle};
+    return 0;
+}
+
+int platform_add_antable(Platform *app, TransformHandle surface_transform,
+                         const ObjectNavMesh *navmesh, const Ant *ants,
+                         size_t ant_count)
+{
+    if (!app || surface_transform >= app->transform_count ||
+        app->transforms[surface_transform].ant_owned || !navmesh || !ants ||
+        !ant_count ||
+        !navmesh->mesh.vertices || !navmesh->mesh.indices || !navmesh->neighbors ||
+        navmesh->mesh.index_count % 3 || ant_count > UINT32_MAX ||
+        app->swarm_count >= MAX_ANT_SWARMS) return -1;
+    uint32_t triangle_count = navmesh->mesh.index_count / 3;
+    if (!triangle_count) return -1;
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(app->physical_device, &properties);
+    if ((VkDeviceSize)triangle_count * sizeof(GpuTriangle) > properties.limits.maxStorageBufferRange ||
+        (VkDeviceSize)ant_count * sizeof(GpuAnt) > properties.limits.maxStorageBufferRange ||
+        (ant_count + ANT_WORKGROUP_SIZE - 1) / ANT_WORKGROUP_SIZE >
+            properties.limits.maxComputeWorkGroupCount[0]) return -1;
+    if (app->swarm_count == app->swarm_capacity) {
+        size_t capacity = app->swarm_capacity ? app->swarm_capacity * 2 : 4;
+        AntSwarm *swarms = realloc(app->swarms, capacity * sizeof(*swarms));
+        if (!swarms) return -1;
+        app->swarms = swarms;
+        app->swarm_capacity = capacity;
+    }
+
+    GpuTriangle *triangles = calloc(triangle_count, sizeof(*triangles));
+    GpuAnt *gpu_ants = calloc(ant_count, sizeof(*gpu_ants));
+    if (!triangles || !gpu_ants) {
+        free(triangles);
+        free(gpu_ants);
+        return -1;
+    }
+    for (uint32_t triangle = 0; triangle < triangle_count; ++triangle) {
+        for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+            uint32_t index = navmesh->mesh.indices[triangle * 3 + vertex];
+            uint32_t neighbor = navmesh->neighbors[triangle * 3 + vertex];
+            if (index >= navmesh->mesh.vertex_count ||
+                (neighbor != OBJECT_NAVMESH_NO_NEIGHBOR && neighbor >= triangle_count)) {
+                free(triangles);
+                free(gpu_ants);
+                return -1;
+            }
+            memcpy(triangles[triangle].vertices[vertex],
+                   navmesh->mesh.vertices[index].position, sizeof(float) * 3);
+            triangles[triangle].vertices[vertex][3] = 1.0f;
+            triangles[triangle].neighbors[vertex] = neighbor;
+            if (neighbor != OBJECT_NAVMESH_NO_NEIGHBOR) {
+                uint32_t edge_a = navmesh->mesh.indices[triangle * 3 + vertex];
+                uint32_t edge_b = navmesh->mesh.indices[triangle * 3 + (vertex + 1) % 3];
+                int reciprocal = 0;
+                for (uint32_t neighbor_edge = 0; neighbor_edge < 3; ++neighbor_edge) {
+                    uint32_t neighbor_a = navmesh->mesh.indices[neighbor * 3 + neighbor_edge];
+                    uint32_t neighbor_b = navmesh->mesh.indices[neighbor * 3 + (neighbor_edge + 1) % 3];
+                    if (((edge_a == neighbor_a && edge_b == neighbor_b) ||
+                         (edge_a == neighbor_b && edge_b == neighbor_a)) &&
+                        navmesh->neighbors[neighbor * 3 + neighbor_edge] == triangle) {
+                        reciprocal = 1;
+                        break;
+                    }
+                }
+                if (!reciprocal) {
+                    free(triangles);
+                    free(gpu_ants);
+                    return -1;
+                }
+            }
+        }
+        float *a = triangles[triangle].vertices[0];
+        float *b = triangles[triangle].vertices[1];
+        float *c = triangles[triangle].vertices[2];
+        float ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        float ac[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        float normal[3] = {
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0]
+        };
+        float area_squared = normal[0] * normal[0] + normal[1] * normal[1]
+            + normal[2] * normal[2];
+        if (!isfinite(area_squared) || area_squared < 1e-16f) {
+            free(triangles);
+            free(gpu_ants);
+            return -1;
+        }
+        triangles[triangle].neighbors[3] = OBJECT_NAVMESH_NO_NEIGHBOR;
+    }
+    for (size_t i = 0; i < ant_count; ++i) {
+        if (ants[i].transform_handle >= app->transform_count ||
+            ants[i].transform_handle == surface_transform ||
+            app->transforms[ants[i].transform_handle].ant_owned ||
+            app->transforms[ants[i].transform_handle].ant_surface ||
+            ants[i].current_triangle >= triangle_count || !isfinite(ants[i].speed) ||
+            ants[i].speed < 0.0f ||
+            !isfinite(ants[i].position[0]) || !isfinite(ants[i].position[1]) ||
+            !isfinite(ants[i].position[2]) || !isfinite(ants[i].tangent[0]) ||
+            !isfinite(ants[i].tangent[1]) || !isfinite(ants[i].tangent[2]) ||
+            (ants[i].tangent[0] == 0.0f && ants[i].tangent[1] == 0.0f &&
+             ants[i].tangent[2] == 0.0f)) {
+            free(triangles);
+            free(gpu_ants);
+            return -1;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (ants[j].transform_handle == ants[i].transform_handle) {
+                free(triangles);
+                free(gpu_ants);
+                return -1;
+            }
+        }
+        const GpuTriangle *triangle = &triangles[ants[i].current_triangle];
+        const float *a = triangle->vertices[0];
+        const float *b = triangle->vertices[1];
+        const float *c = triangle->vertices[2];
+        float v0[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        float v1[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        float v2[3] = {ants[i].position[0] - a[0], ants[i].position[1] - a[1],
+                       ants[i].position[2] - a[2]};
+        float d00 = v0[0] * v0[0] + v0[1] * v0[1] + v0[2] * v0[2];
+        float d01 = v0[0] * v1[0] + v0[1] * v1[1] + v0[2] * v1[2];
+        float d11 = v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2];
+        float d20 = v2[0] * v0[0] + v2[1] * v0[1] + v2[2] * v0[2];
+        float d21 = v2[0] * v1[0] + v2[1] * v1[1] + v2[2] * v1[2];
+        float denominator = d00 * d11 - d01 * d01;
+        float bary_y = (d11 * d20 - d01 * d21) / denominator;
+        float bary_z = (d00 * d21 - d01 * d20) / denominator;
+        float bary_x = 1.0f - bary_y - bary_z;
+        float normal[3] = {
+            v0[1] * v1[2] - v0[2] * v1[1],
+            v0[2] * v1[0] - v0[0] * v1[2],
+            v0[0] * v1[1] - v0[1] * v1[0]
+        };
+        float tangent_dot_normal = ants[i].tangent[0] * normal[0]
+            + ants[i].tangent[1] * normal[1] + ants[i].tangent[2] * normal[2];
+        float tangent_cross_squared = 0.0f;
+        for (uint32_t axis = 0; axis < 3; ++axis) {
+            float projected = ants[i].tangent[axis]
+                - normal[axis] * tangent_dot_normal /
+                  (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+            tangent_cross_squared += projected * projected;
+        }
+        float normal_length = sqrtf(normal[0] * normal[0] + normal[1] * normal[1]
+            + normal[2] * normal[2]);
+        float plane_distance = fabsf(v2[0] * normal[0] + v2[1] * normal[1]
+            + v2[2] * normal[2]) / normal_length;
+        float triangle_scale = sqrtf(fmaxf(d00, d11));
+        if (bary_x < -1e-4f || bary_y < -1e-4f || bary_z < -1e-4f ||
+            !isfinite(bary_x) || !isfinite(bary_y) || !isfinite(bary_z) ||
+            !isfinite(tangent_cross_squared) || tangent_cross_squared < 1e-12f ||
+            !isfinite(plane_distance) || plane_distance > triangle_scale * 1e-4f) {
+            free(triangles);
+            free(gpu_ants);
+            return -1;
+        }
+        gpu_ants[i].data[0] = ants[i].transform_handle;
+        gpu_ants[i].data[1] = ants[i].current_triangle;
+        memcpy(gpu_ants[i].position_speed, ants[i].position, sizeof(ants[i].position));
+        gpu_ants[i].position_speed[3] = ants[i].speed;
+        memcpy(gpu_ants[i].tangent, ants[i].tangent, sizeof(ants[i].tangent));
+    }
+
+    AntSwarm swarm = {0};
+    int result = create_buffer(app, (VkDeviceSize)triangle_count * sizeof(*triangles),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, triangles,
+        &swarm.triangle_buffer, &swarm.triangle_memory);
+    if (!result)
+        result = create_buffer(app, (VkDeviceSize)ant_count * sizeof(*gpu_ants),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gpu_ants,
+            &swarm.ant_buffer, &swarm.ant_memory);
+    free(triangles);
+    free(gpu_ants);
+    if (result) {
+        vkDestroyBuffer(app->device, swarm.ant_buffer, NULL);
+        vkFreeMemory(app->device, swarm.ant_memory, NULL);
+        vkDestroyBuffer(app->device, swarm.triangle_buffer, NULL);
+        vkFreeMemory(app->device, swarm.triangle_memory, NULL);
+        return -1;
+    }
+
+    VkDescriptorSetAllocateInfo set_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = app->descriptor_pool, .descriptorSetCount = 1,
+        .pSetLayouts = &app->transform_descriptor_layout
+    };
+    if (vk_error(vkAllocateDescriptorSets(app->device, &set_info, &swarm.descriptor_set),
+        "ant swarm descriptor set")) {
+        vkDestroyBuffer(app->device, swarm.ant_buffer, NULL);
+        vkFreeMemory(app->device, swarm.ant_memory, NULL);
+        vkDestroyBuffer(app->device, swarm.triangle_buffer, NULL);
+        vkFreeMemory(app->device, swarm.triangle_memory, NULL);
+        return -1;
+    }
+    VkDescriptorBufferInfo buffer_infos[3] = {
+        {.buffer = app->transform_buffer, .range = VK_WHOLE_SIZE},
+        {.buffer = swarm.triangle_buffer, .range = VK_WHOLE_SIZE},
+        {.buffer = swarm.ant_buffer, .range = VK_WHOLE_SIZE}
+    };
+    VkWriteDescriptorSet writes[3] = {0};
+    for (uint32_t binding = 0; binding < 3; ++binding) {
+        writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[binding].dstSet = swarm.descriptor_set;
+        writes[binding].dstBinding = binding;
+        writes[binding].descriptorCount = 1;
+        writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[binding].pBufferInfo = &buffer_infos[binding];
+    }
+    vkUpdateDescriptorSets(app->device, 3, writes, 0, NULL);
+    swarm.triangle_count = triangle_count;
+    swarm.ant_count = (uint32_t)ant_count;
+    swarm.surface_transform = surface_transform;
+
+    app->swarms[app->swarm_count++] = swarm;
+    app->transforms[surface_transform].ant_surface = 1;
+    for (size_t i = 0; i < ant_count; ++i)
+        app->transforms[ants[i].transform_handle].ant_owned = 1;
+    app->ants_need_dispatch = 1;
+    return 0;
+}
+
+void platform_step_ants(Platform *app, float delta_seconds)
+{
+    if (!app || !isfinite(delta_seconds) || delta_seconds <= 0.0f) return;
+    app->swarm_delta_seconds += delta_seconds;
+    if (app->swarm_delta_seconds > 0.1f) app->swarm_delta_seconds = 0.1f;
 }
 
 static VkSurfaceFormatKHR choose_surface_format(const VkSurfaceFormatKHR *formats, uint32_t count)
@@ -444,6 +784,94 @@ static int read_shader(const char *name, uint32_t **code, size_t *size)
     return 0;
 }
 
+static int create_transform_and_compute_resources(Platform *app)
+{
+    VkDescriptorSetLayoutBinding bindings[3] = {
+        {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT}
+    };
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3, .pBindings = bindings
+    };
+    if (vk_error(vkCreateDescriptorSetLayout(app->device, &layout_info, NULL,
+        &app->transform_descriptor_layout), "transform descriptor layout")) return -1;
+
+    VkDescriptorPoolSize pool_size = {
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 3 + MAX_ANT_SWARMS * 3
+    };
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1 + MAX_ANT_SWARMS,
+        .poolSizeCount = 1, .pPoolSizes = &pool_size
+    };
+    if (vk_error(vkCreateDescriptorPool(app->device, &pool_info, NULL,
+        &app->descriptor_pool), "transform descriptor pool")) return -1;
+
+    VkDeviceSize transform_buffer_size =
+        (VkDeviceSize)MAX_TRANSFORMS * sizeof(GpuTransform);
+    if (create_buffer(app, transform_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        NULL, &app->transform_buffer, &app->transform_memory)) return -1;
+    VkDescriptorSetAllocateInfo set_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = app->descriptor_pool, .descriptorSetCount = 1,
+        .pSetLayouts = &app->transform_descriptor_layout
+    };
+    if (vk_error(vkAllocateDescriptorSets(app->device, &set_info,
+        &app->transform_descriptor_set), "transform descriptor set")) return -1;
+    VkDescriptorBufferInfo transform_info = {
+        .buffer = app->transform_buffer, .offset = 0, .range = transform_buffer_size
+    };
+    VkWriteDescriptorSet transform_write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = app->transform_descriptor_set, .dstBinding = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &transform_info
+    };
+    vkUpdateDescriptorSets(app->device, 1, &transform_write, 0, NULL);
+
+    VkPushConstantRange compute_push = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 32
+    };
+    VkPipelineLayoutCreateInfo compute_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &app->transform_descriptor_layout,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &compute_push
+    };
+    if (vk_error(vkCreatePipelineLayout(app->device, &compute_layout_info, NULL,
+        &app->compute_pipeline_layout), "ant compute pipeline layout")) return -1;
+
+    uint32_t *code = NULL;
+    size_t size = 0;
+    if (read_shader("ant.comp", &code, &size)) return -1;
+    VkShaderModuleCreateInfo module_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = size, .pCode = code
+    };
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkResult result = vkCreateShaderModule(app->device, &module_info, NULL, &module);
+    free(code);
+    if (vk_error(result, "ant compute shader module")) return -1;
+    VkPipelineShaderStageCreateInfo stage = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"
+    };
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = stage, .layout = app->compute_pipeline_layout
+    };
+    result = vkCreateComputePipelines(app->device, VK_NULL_HANDLE, 1,
+        &pipeline_info, NULL, &app->compute_pipeline);
+    vkDestroyShaderModule(app->device, module, NULL);
+    return vk_error(result, "ant compute pipeline");
+}
+
 static int create_pipeline(Platform *app)
 {
     uint32_t *vertex_code = NULL, *fragment_code = NULL;
@@ -493,15 +921,15 @@ static int create_pipeline(Platform *app)
     VkPipelineDynamicStateCreateInfo dynamic = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .dynamicStateCount = 2, .pDynamicStates = dynamic_states};
 
-    /* Frame and object data share one vertex range; lighting occupies distinct bytes. */
     VkPushConstantRange push_ranges[2] = {
         {.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
          .offset = VIEW_PROJECTION_PUSH_OFFSET,
-         .size = VIEW_PROJECTION_PUSH_SIZE + OBJECT_PUSH_SIZE},
+         .size = VIEW_PROJECTION_PUSH_SIZE},
         {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
          .offset = LIGHT_PUSH_OFFSET, .size = LIGHT_PUSH_SIZE}
     };
     VkPipelineLayoutCreateInfo layout_info = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &app->transform_descriptor_layout,
         .pushConstantRangeCount = 2, .pPushConstantRanges = push_ranges};
     result = vkCreatePipelineLayout(app->device, &layout_info, NULL, &app->pipeline_layout);
     if (result == VK_SUCCESS) {
@@ -581,12 +1009,70 @@ static int create_commands_and_sync(Platform *app)
     return 0;
 }
 
-static int record_commands(Platform *app, uint32_t image_index, const PlatformScene *scene,
-                           const PlatformObject *objects, size_t object_count)
+static int upload_dirty_transforms(Platform *app)
+{
+    if (!app->transform_count) return 0;
+    int has_dirty = 0;
+    for (size_t i = 0; i < app->transform_count; ++i) has_dirty |= app->transforms[i].dirty;
+    if (!has_dirty) return 0;
+
+    GpuTransform *gpu_transforms = NULL;
+    VkDeviceSize size = (VkDeviceSize)app->transform_count * sizeof(*gpu_transforms);
+    if (vk_error(vkMapMemory(app->device, app->transform_memory, 0, size, 0,
+        (void **)&gpu_transforms), "map transforms")) return -1;
+    for (size_t i = 0; i < app->transform_count; ++i) {
+        if (!app->transforms[i].dirty) continue;
+        const Transform *transform = &app->transforms[i].transform;
+        memcpy(gpu_transforms[i].rotation, transform->rotation, sizeof(gpu_transforms[i].rotation));
+        memcpy(gpu_transforms[i].position, transform->position, sizeof(transform->position));
+        gpu_transforms[i].position[3] = 1.0f;
+        app->transforms[i].dirty = 0;
+    }
+    vkUnmapMemory(app->device, app->transform_memory);
+    return 0;
+}
+
+static int record_commands(Platform *app, uint32_t image_index, const Scene *scene)
 {
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (vk_error(vkBeginCommandBuffer(app->command_buffer, &begin), "begin command buffer")) return -1;
+    if ((app->swarm_delta_seconds > 0.0f || app->ants_need_dispatch) && app->swarm_count) {
+        typedef struct AntUpdate {
+            float delta_seconds;
+            float surface_offset;
+            uint32_t ant_count;
+            uint32_t triangle_count;
+            uint32_t surface_transform;
+            uint32_t padding[3];
+        } AntUpdate;
+        vkCmdBindPipeline(app->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          app->compute_pipeline);
+        for (size_t i = 0; i < app->swarm_count; ++i) {
+            const AntSwarm *swarm = &app->swarms[i];
+            AntUpdate update = {
+                .delta_seconds = app->swarm_delta_seconds,
+                .surface_offset = 0.0f,
+                .ant_count = swarm->ant_count,
+                .triangle_count = swarm->triangle_count,
+                .surface_transform = swarm->surface_transform
+            };
+            vkCmdBindDescriptorSets(app->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                app->compute_pipeline_layout, 0, 1, &swarm->descriptor_set, 0, NULL);
+            vkCmdPushConstants(app->command_buffer, app->compute_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(update), &update);
+            vkCmdDispatch(app->command_buffer,
+                (swarm->ant_count + ANT_WORKGROUP_SIZE - 1) / ANT_WORKGROUP_SIZE, 1, 1);
+        }
+        VkMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+        };
+        vkCmdPipelineBarrier(app->command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL);
+    }
     VkClearValue clears[2] = {
         {.color = {{0.025f, 0.035f, 0.055f, 1.0f}}},
         {.depthStencil = {1.0f, 0}}
@@ -596,6 +1082,8 @@ static int record_commands(Platform *app, uint32_t image_index, const PlatformSc
         .renderArea = {.extent = app->extent}, .clearValueCount = 2, .pClearValues = clears};
     vkCmdBeginRenderPass(app->command_buffer, &render, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(app->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app->pipeline);
+    vkCmdBindDescriptorSets(app->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        app->pipeline_layout, 0, 1, &app->transform_descriptor_set, 0, NULL);
     VkViewport viewport = {0, 0, (float)app->extent.width, (float)app->extent.height, 0, 1};
     VkRect2D scissor = {.extent = app->extent};
     vkCmdSetViewport(app->command_buffer, 0, 1, &viewport);
@@ -604,38 +1092,28 @@ static int record_commands(Platform *app, uint32_t image_index, const PlatformSc
         VIEW_PROJECTION_PUSH_OFFSET, VIEW_PROJECTION_PUSH_SIZE, scene->view_projection);
     vkCmdPushConstants(app->command_buffer, app->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
         LIGHT_PUSH_OFFSET, LIGHT_PUSH_SIZE, scene->light_direction);
-    for (size_t i = 0; i < object_count; ++i) {
-        const PlatformObject *object = &objects[i];
-        const PlatformMesh *mesh = &app->meshes[object->mesh_index];
-        PushConstants push = {0};
-        memcpy(push.rotation, object->rotation, sizeof(push.rotation));
-        memcpy(push.position, object->position, sizeof(object->position));
+    for (size_t i = 0; i < app->drawable_count; ++i) {
+        const PlatformDrawable *drawable = &app->drawables[i];
+        const PlatformMesh *mesh = &app->meshes[drawable->mesh_handle];
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(app->command_buffer, 0, 1, &mesh->vertex_buffer, &offset);
         vkCmdBindIndexBuffer(app->command_buffer, mesh->index_buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdPushConstants(app->command_buffer, app->pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-            OBJECT_PUSH_OFFSET, OBJECT_PUSH_SIZE, push.rotation);
-        vkCmdDrawIndexed(app->command_buffer, mesh->index_count, 1, 0, 0, 0);
+        vkCmdDrawIndexed(app->command_buffer, mesh->index_count, 1, 0, 0,
+                         drawable->transform_handle);
     }
     vkCmdEndRenderPass(app->command_buffer);
     return vk_error(vkEndCommandBuffer(app->command_buffer), "end command buffer");
 }
 
-int platform_draw(Platform *app, const PlatformScene *scene,
-                  const PlatformObject *objects, size_t object_count)
+int platform_draw(Platform *app, const Scene *scene)
 {
-    if (!app || !scene || (object_count && !objects)) return -1;
-    for (size_t i = 0; i < object_count; ++i) {
-        if (objects[i].mesh_index >= app->mesh_count) {
-            fprintf(stderr, "Invalid mesh index %u\n", objects[i].mesh_index);
-            return -1;
-        }
-    }
+    if (!app || !scene) return -1;
     if (app->framebuffer_resized && recreate_swapchain(app)) return -1;
     int width, height;
     SDL_Vulkan_GetDrawableSize(app->window, &width, &height);
     if (width == 0 || height == 0) { SDL_Delay(20); return 0; }
     vkWaitForFences(app->device, 1, &app->frame_fence, VK_TRUE, UINT64_MAX);
+    if (upload_dirty_transforms(app)) return -1;
     uint32_t image_index;
     VkResult result = vkAcquireNextImageKHR(app->device, app->swapchain, UINT64_MAX,
         app->image_available, VK_NULL_HANDLE, &image_index);
@@ -643,7 +1121,9 @@ int platform_draw(Platform *app, const PlatformScene *scene,
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return vk_error(result, "acquire swapchain image");
     vkResetFences(app->device, 1, &app->frame_fence);
     vkResetCommandBuffer(app->command_buffer, 0);
-    if (record_commands(app, image_index, scene, objects, object_count)) return -1;
+    if (record_commands(app, image_index, scene)) return -1;
+    app->swarm_delta_seconds = 0.0f;
+    app->ants_need_dispatch = 0;
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .waitSemaphoreCount = 1, .pWaitSemaphores = &app->image_available, .pWaitDstStageMask = &wait_stage,
@@ -664,12 +1144,27 @@ static void cleanup(Platform *app)
     if (app->device) vkDeviceWaitIdle(app->device);
     destroy_swapchain(app);
     if (app->device) {
+        vkDestroyPipeline(app->device, app->compute_pipeline, NULL);
+        vkDestroyPipelineLayout(app->device, app->compute_pipeline_layout, NULL);
+        for (size_t i = 0; i < app->swarm_count; ++i) {
+            vkDestroyBuffer(app->device, app->swarms[i].ant_buffer, NULL);
+            vkFreeMemory(app->device, app->swarms[i].ant_memory, NULL);
+            vkDestroyBuffer(app->device, app->swarms[i].triangle_buffer, NULL);
+            vkFreeMemory(app->device, app->swarms[i].triangle_memory, NULL);
+        }
+        free(app->swarms);
+        vkDestroyDescriptorPool(app->device, app->descriptor_pool, NULL);
+        vkDestroyDescriptorSetLayout(app->device, app->transform_descriptor_layout, NULL);
+        vkDestroyBuffer(app->device, app->transform_buffer, NULL);
+        vkFreeMemory(app->device, app->transform_memory, NULL);
         vkDestroyFence(app->device, app->frame_fence, NULL);
         vkDestroySemaphore(app->device, app->render_finished, NULL);
         vkDestroySemaphore(app->device, app->image_available, NULL);
         vkDestroyCommandPool(app->device, app->command_pool, NULL);
         for (size_t i = 0; i < app->mesh_count; ++i) destroy_mesh(app, &app->meshes[i]);
         free(app->meshes);
+        free(app->drawables);
+        free(app->transforms);
         vkDestroyDevice(app->device, NULL);
     }
     if (app->surface) vkDestroySurfaceKHR(app->instance, app->surface, NULL);
@@ -695,7 +1190,8 @@ Platform *platform_create(const char *title, int width, int height)
         return NULL;
     }
     if (create_instance(app) || !SDL_Vulkan_CreateSurface(app->window, app->instance, &app->surface) ||
-        create_device(app) || create_commands_and_sync(app) || build_swapchain(app)) {
+        create_device(app) || create_commands_and_sync(app) ||
+        create_transform_and_compute_resources(app) || build_swapchain(app)) {
         if (!app->surface) fprintf(stderr, "SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
         platform_destroy(app);
         return NULL;
@@ -710,7 +1206,7 @@ void platform_destroy(Platform *app)
     free(app);
 }
 
-void platform_poll_input(Platform *app, PlatformInput *input)
+void platform_poll_input(Platform *app, Input *input)
 {
     memset(input, 0, sizeof(*input));
     SDL_Event event;
