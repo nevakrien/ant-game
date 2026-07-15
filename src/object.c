@@ -20,6 +20,15 @@ typedef struct IndexArray {
     size_t capacity;
 } IndexArray;
 
+typedef struct NavEdge {
+    uint32_t first;
+    uint32_t second;
+    uint32_t triangle;
+    uint32_t edge;
+} NavEdge;
+
+static const unsigned char navmesh_magic[8] = {'A', 'N', 'T', 'N', 'A', 'V', 1, 0};
+
 static int append_floats(FloatArray *array, const float values[3])
 {
     if (array->count + 3 > array->capacity) {
@@ -267,4 +276,281 @@ void object_mesh_destroy(ObjectMesh *mesh)
     free(mesh->vertices);
     free(mesh->indices);
     memset(mesh, 0, sizeof(*mesh));
+}
+
+static int point_inside_edge(const float point[3], const float start[3], const float end[3],
+                             float *distance)
+{
+    float direction[3], offset[3];
+    float length_squared = 0.0f;
+    float projection = 0.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        direction[axis] = end[axis] - start[axis];
+        offset[axis] = point[axis] - start[axis];
+        length_squared += direction[axis] * direction[axis];
+        projection += offset[axis] * direction[axis];
+    }
+    if (length_squared <= 1.0e-12f) return 0;
+
+    float t = projection / length_squared;
+    if (t <= 1.0e-5f || t >= 1.0f - 1.0e-5f) return 0;
+
+    float error_squared = 0.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        float error = offset[axis] - t * direction[axis];
+        error_squared += error * error;
+    }
+    if (error_squared > length_squared * 1.0e-10f) return 0;
+    *distance = t;
+    return 1;
+}
+
+static int split_edges(ObjectMesh *mesh)
+{
+    for (;;) {
+        uint32_t split_triangle = UINT32_MAX;
+        uint32_t split_edge = 0;
+        uint32_t split_vertex = 0;
+        float nearest = 2.0f;
+
+        for (uint32_t triangle = 0; triangle < mesh->index_count / 3; ++triangle) {
+            uint32_t *indices = mesh->indices + triangle * 3;
+            for (uint32_t edge = 0; edge < 3; ++edge) {
+                uint32_t start = indices[edge];
+                uint32_t end = indices[(edge + 1) % 3];
+                for (uint32_t vertex = 0; vertex < mesh->vertex_count; ++vertex) {
+                    float distance;
+                    if (vertex != start && vertex != end &&
+                        point_inside_edge(mesh->vertices[vertex].position,
+                                          mesh->vertices[start].position,
+                                          mesh->vertices[end].position, &distance) &&
+                        distance < nearest) {
+                        split_triangle = triangle;
+                        split_edge = edge;
+                        split_vertex = vertex;
+                        nearest = distance;
+                    }
+                }
+                if (split_triangle != UINT32_MAX) break;
+            }
+            if (split_triangle != UINT32_MAX) break;
+        }
+        if (split_triangle == UINT32_MAX) return 0;
+        if (mesh->index_count > UINT32_MAX - 3) return -1;
+
+        uint32_t *indices = realloc(mesh->indices,
+                                    ((size_t)mesh->index_count + 3) * sizeof(*mesh->indices));
+        if (!indices) return -1;
+        mesh->indices = indices;
+
+        uint32_t *triangle = mesh->indices + split_triangle * 3;
+        uint32_t start = triangle[split_edge];
+        uint32_t end = triangle[(split_edge + 1) % 3];
+        uint32_t opposite = triangle[(split_edge + 2) % 3];
+        triangle[0] = start;
+        triangle[1] = split_vertex;
+        triangle[2] = opposite;
+        mesh->indices[mesh->index_count] = split_vertex;
+        mesh->indices[mesh->index_count + 1] = end;
+        mesh->indices[mesh->index_count + 2] = opposite;
+        mesh->index_count += 3;
+    }
+}
+
+static int compare_edges(const void *left_pointer, const void *right_pointer)
+{
+    const NavEdge *left = left_pointer;
+    const NavEdge *right = right_pointer;
+    if (left->first != right->first) return left->first < right->first ? -1 : 1;
+    if (left->second != right->second) return left->second < right->second ? -1 : 1;
+    return 0;
+}
+
+static int build_neighbors(ObjectNavMesh *navmesh)
+{
+    uint32_t edge_count = navmesh->mesh.index_count;
+    NavEdge *edges = malloc((size_t)edge_count * sizeof(*edges));
+    navmesh->neighbors = malloc((size_t)edge_count * sizeof(*navmesh->neighbors));
+    if (!edges || !navmesh->neighbors) {
+        free(edges);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < edge_count; ++i) {
+        uint32_t triangle = i / 3;
+        uint32_t edge = i % 3;
+        uint32_t first = navmesh->mesh.indices[i];
+        uint32_t second = navmesh->mesh.indices[triangle * 3 + (edge + 1) % 3];
+        edges[i].first = first < second ? first : second;
+        edges[i].second = first < second ? second : first;
+        edges[i].triangle = triangle;
+        edges[i].edge = edge;
+        navmesh->neighbors[i] = OBJECT_NAVMESH_NO_NEIGHBOR;
+    }
+    qsort(edges, edge_count, sizeof(*edges), compare_edges);
+
+    for (uint32_t i = 0; i < edge_count;) {
+        uint32_t end = i + 1;
+        while (end < edge_count && edges[end].first == edges[i].first &&
+               edges[end].second == edges[i].second)
+            ++end;
+        if (end - i > 2) {
+            free(edges);
+            return -1;
+        }
+        if (end - i == 2) {
+            NavEdge *a = &edges[i];
+            NavEdge *b = &edges[i + 1];
+            if (a->triangle == b->triangle) {
+                free(edges);
+                return -1;
+            }
+            navmesh->neighbors[a->triangle * 3 + a->edge] = b->triangle;
+            navmesh->neighbors[b->triangle * 3 + b->edge] = a->triangle;
+        }
+        i = end;
+    }
+    free(edges);
+    return 0;
+}
+
+int object_navmesh_build(ObjectMesh *mesh, ObjectNavMesh *navmesh)
+{
+    if (!mesh || !navmesh || !mesh->vertices || !mesh->indices ||
+        !mesh->vertex_count || !mesh->index_count || mesh->index_count % 3)
+        return -1;
+    memset(navmesh, 0, sizeof(*navmesh));
+    for (uint32_t i = 0; i < mesh->index_count; ++i)
+        if (mesh->indices[i] >= mesh->vertex_count) return -1;
+
+    if (split_edges(mesh)) return -1;
+    navmesh->mesh = *mesh;
+    if (build_neighbors(navmesh)) {
+        free(navmesh->neighbors);
+        memset(navmesh, 0, sizeof(*navmesh));
+        return -1;
+    }
+    memset(mesh, 0, sizeof(*mesh));
+    return 0;
+}
+
+static int write_bytes(FILE *file, const void *data, size_t size)
+{
+    return fwrite(data, 1, size, file) == size ? 0 : -1;
+}
+
+static int write_u32(FILE *file, uint32_t value)
+{
+    unsigned char bytes[4] = {
+        (unsigned char)value, (unsigned char)(value >> 8),
+        (unsigned char)(value >> 16), (unsigned char)(value >> 24)
+    };
+    return write_bytes(file, bytes, sizeof(bytes));
+}
+
+static int write_float(FILE *file, float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return write_u32(file, bits);
+}
+
+int object_navmesh_save_file(const char *path, const ObjectNavMesh *navmesh)
+{
+    if (!path || !navmesh || !navmesh->mesh.vertices || !navmesh->mesh.indices ||
+        !navmesh->neighbors || !navmesh->mesh.vertex_count || !navmesh->mesh.index_count ||
+        navmesh->mesh.index_count % 3)
+        return -1;
+
+    FILE *file = fopen(path, "wb");
+    if (!file) return -1;
+    int failed = write_bytes(file, navmesh_magic, sizeof(navmesh_magic)) ||
+                 write_u32(file, navmesh->mesh.vertex_count) ||
+                 write_u32(file, navmesh->mesh.index_count / 3);
+    for (uint32_t i = 0; !failed && i < navmesh->mesh.vertex_count; ++i)
+        for (int component = 0; !failed && component < 3; ++component) {
+            failed = write_float(file, navmesh->mesh.vertices[i].position[component]);
+            if (!failed) failed = write_float(file, navmesh->mesh.vertices[i].normal[component]);
+        }
+    for (uint32_t i = 0; !failed && i < navmesh->mesh.index_count; ++i)
+        failed = write_u32(file, navmesh->mesh.indices[i]);
+    for (uint32_t i = 0; !failed && i < navmesh->mesh.index_count; ++i)
+        failed = write_u32(file, navmesh->neighbors[i]);
+    if (fclose(file)) failed = -1;
+    return failed ? -1 : 0;
+}
+
+static int read_bytes(FILE *file, void *data, size_t size)
+{
+    return fread(data, 1, size, file) == size ? 0 : -1;
+}
+
+static int read_u32(FILE *file, uint32_t *value)
+{
+    unsigned char bytes[4];
+    if (read_bytes(file, bytes, sizeof(bytes))) return -1;
+    *value = (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 |
+             (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+    return 0;
+}
+
+static int read_float(FILE *file, float *value)
+{
+    uint32_t bits;
+    if (read_u32(file, &bits)) return -1;
+    memcpy(value, &bits, sizeof(bits));
+    return 0;
+}
+
+int object_navmesh_load_file(const char *path, ObjectNavMesh *navmesh)
+{
+    unsigned char magic[sizeof(navmesh_magic)];
+    uint32_t triangle_count;
+    if (!path || !navmesh) return -1;
+    memset(navmesh, 0, sizeof(*navmesh));
+
+    FILE *file = fopen(path, "rb");
+    if (!file) return -1;
+    int failed = read_bytes(file, magic, sizeof(magic)) ||
+                 memcmp(magic, navmesh_magic, sizeof(magic)) ||
+                 read_u32(file, &navmesh->mesh.vertex_count) ||
+                 read_u32(file, &triangle_count) || !navmesh->mesh.vertex_count ||
+                 !triangle_count || triangle_count > UINT32_MAX / 3;
+    if (!failed) {
+        navmesh->mesh.index_count = triangle_count * 3;
+        navmesh->mesh.vertices = malloc((size_t)navmesh->mesh.vertex_count *
+                                        sizeof(*navmesh->mesh.vertices));
+        navmesh->mesh.indices = malloc((size_t)navmesh->mesh.index_count *
+                                       sizeof(*navmesh->mesh.indices));
+        navmesh->neighbors = malloc((size_t)navmesh->mesh.index_count *
+                                    sizeof(*navmesh->neighbors));
+        if (!navmesh->mesh.vertices || !navmesh->mesh.indices || !navmesh->neighbors)
+            failed = -1;
+    }
+    for (uint32_t i = 0; !failed && i < navmesh->mesh.vertex_count; ++i)
+        for (int component = 0; !failed && component < 3; ++component) {
+            failed = read_float(file, &navmesh->mesh.vertices[i].position[component]);
+            if (!failed) failed = read_float(file, &navmesh->mesh.vertices[i].normal[component]);
+        }
+    for (uint32_t i = 0; !failed && i < navmesh->mesh.index_count; ++i) {
+        failed = read_u32(file, &navmesh->mesh.indices[i]);
+        if (!failed && navmesh->mesh.indices[i] >= navmesh->mesh.vertex_count) failed = -1;
+    }
+    for (uint32_t i = 0; !failed && i < navmesh->mesh.index_count; ++i) {
+        failed = read_u32(file, &navmesh->neighbors[i]);
+        if (!failed && navmesh->neighbors[i] != OBJECT_NAVMESH_NO_NEIGHBOR &&
+            navmesh->neighbors[i] >= triangle_count)
+            failed = -1;
+    }
+    fclose(file);
+    if (failed) object_navmesh_destroy(navmesh);
+    return failed ? -1 : 0;
+}
+
+void object_navmesh_destroy(ObjectNavMesh *navmesh)
+{
+    if (!navmesh) return;
+    object_mesh_destroy(&navmesh->mesh);
+    free(navmesh->neighbors);
+    memset(navmesh, 0, sizeof(*navmesh));
 }

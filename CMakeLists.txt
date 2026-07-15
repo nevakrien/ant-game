@@ -32,9 +32,13 @@ add_library(object_mesh STATIC src/object.c)
 target_include_directories(object_mesh PUBLIC include)
 target_link_libraries(object_mesh PUBLIC m)
 
+add_executable(navmesh_tool src/navmesh_cli.c)
+target_link_libraries(navmesh_tool PRIVATE object_mesh)
+
 add_executable(vulkan_teapot
     src/main.c
-    src/app.c)
+    src/app.c
+    src/platform.c)
 add_dependencies(vulkan_teapot object_shaders)
 target_include_directories(vulkan_teapot PRIVATE include)
 target_compile_definitions(vulkan_teapot PRIVATE
@@ -46,11 +50,14 @@ target_link_libraries(vulkan_teapot PRIVATE
 if(BUILD_TESTING)
     add_executable(object_mesh_test tests/object_test.c)
     target_link_libraries(object_mesh_test PRIVATE object_mesh)
-    add_test(NAME object_mesh_test COMMAND object_mesh_test "${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj")
+    add_test(NAME object_mesh_test COMMAND object_mesh_test
+             "${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj"
+             "${CMAKE_CURRENT_BINARY_DIR}/object_test.nav")
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(object_mesh PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(navmesh_tool PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(vulkan_teapot PRIVATE -Wall -Wextra -Wpedantic)
     if(BUILD_TESTING)
         target_compile_options(object_mesh_test PRIVATE -Wall -Wextra -Wpedantic)
