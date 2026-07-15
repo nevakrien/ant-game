@@ -1,5 +1,5 @@
 #include "platform.h"
-#include "object.h"
+#include "platform_internal.h"
 
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -14,130 +14,6 @@
 #ifndef OBJECT_SHADER_DIR
 #define OBJECT_SHADER_DIR "shaders"
 #endif
-
-typedef struct PlatformMesh {
-    VkBuffer vertex_buffer;
-    VkDeviceMemory vertex_memory;
-    VkBuffer index_buffer;
-    VkDeviceMemory index_memory;
-    uint32_t index_count;
-} PlatformMesh;
-
-typedef struct PlatformModel {
-    Model model;
-    uint32_t first_instance;
-    uint32_t instance_count;
-} PlatformModel;
-
-typedef struct GpuTransform {
-    float rotation[4];
-    float position[4];
-} GpuTransform;
-
-typedef struct GpuTriangle {
-    float vertices[3][4];
-    uint32_t neighbors[4];
-} GpuTriangle;
-
-typedef struct GpuAnt {
-    uint32_t data[4];
-    float position_speed[4];
-    float tangent[4];
-} GpuAnt;
-
-typedef struct TransformRecord {
-    Transform transform;
-    int dirty;
-    int ant_owned;
-    int ant_surface;
-} TransformRecord;
-
-typedef struct PlatformDrawable {
-    ModelHandle model_handle;
-    TransformHandle transform_handle;
-} PlatformDrawable;
-
-typedef struct AntSwarm {
-    VkBuffer triangle_buffer;
-    VkDeviceMemory triangle_memory;
-    VkBuffer ant_buffer;
-    VkDeviceMemory ant_memory;
-    VkDescriptorSet descriptor_set;
-    uint32_t triangle_count;
-    uint32_t ant_count;
-    TransformHandle surface_transform;
-} AntSwarm;
-
-enum {
-    MAX_TRANSFORMS = 65536,
-    MAX_ANT_SWARMS = 1024,
-    ANT_WORKGROUP_SIZE = 64
-};
-
-struct Platform {
-    SDL_Window *window;
-    VkInstance instance;
-    VkSurfaceKHR surface;
-    VkPhysicalDevice physical_device;
-    VkDevice device;
-    uint32_t graphics_family;
-    uint32_t present_family;
-    VkQueue graphics_queue;
-    VkQueue present_queue;
-    VkSwapchainKHR swapchain;
-    VkFormat swapchain_format;
-    VkExtent2D extent;
-    uint32_t image_count;
-    VkImage *images;
-    VkImageView *image_views;
-    VkFramebuffer *framebuffers;
-    VkRenderPass render_pass;
-    VkPipelineLayout pipeline_layout;
-    VkPipeline pipeline;
-    VkImage depth_image;
-    VkDeviceMemory depth_memory;
-    VkImageView depth_view;
-    PlatformMesh *meshes;
-    size_t mesh_count;
-    size_t mesh_capacity;
-    PlatformModel *models;
-    size_t model_count;
-    size_t model_capacity;
-    TransformRecord *transforms;
-    size_t transform_count;
-    size_t transform_capacity;
-    PlatformDrawable *drawables;
-    size_t drawable_count;
-    size_t drawable_capacity;
-    VkBuffer transform_buffer;
-    VkDeviceMemory transform_memory;
-    VkBuffer instance_buffer;
-    VkDeviceMemory instance_memory;
-    int instances_dirty;
-    VkDescriptorSetLayout transform_descriptor_layout;
-    VkDescriptorPool descriptor_pool;
-    VkDescriptorSet transform_descriptor_set;
-    VkPipelineLayout compute_pipeline_layout;
-    VkPipeline compute_pipeline;
-    AntSwarm *swarms;
-    size_t swarm_count;
-    size_t swarm_capacity;
-    float swarm_delta_seconds;
-    int ants_need_dispatch;
-    VkCommandPool command_pool;
-    VkCommandBuffer command_buffer;
-    VkSemaphore image_available;
-    VkSemaphore render_finished;
-    VkFence frame_fence;
-    int framebuffer_resized;
-};
-
-typedef struct PushConstants {
-    float view_projection[16];
-    float light_direction[4];
-    float base_color[4];
-    float rim_color[4];
-} PushConstants;
 
 enum {
     VIEW_PROJECTION_PUSH_OFFSET = offsetof(PushConstants, view_projection),
@@ -339,7 +215,7 @@ static int create_mesh(Platform *app, const ObjectMesh *source, PlatformMesh *me
     return result;
 }
 
-int platform_add_mesh(Platform *app, const ObjectMesh *source, MeshHandle *mesh_handle)
+int render_add_mesh(Platform *app, const ObjectMesh *source, MeshHandle *mesh_handle)
 {
     if (!app || !mesh_handle || app->mesh_count >= UINT32_MAX) return -1;
     PlatformMesh mesh;
@@ -359,7 +235,7 @@ int platform_add_mesh(Platform *app, const ObjectMesh *source, MeshHandle *mesh_
     return 0;
 }
 
-int platform_update_mesh(Platform *app, MeshHandle mesh_handle, const ObjectMesh *source)
+int render_update_mesh(Platform *app, MeshHandle mesh_handle, const ObjectMesh *source)
 {
     if (!app || mesh_handle >= app->mesh_count) return -1;
     PlatformMesh mesh;
@@ -370,78 +246,7 @@ int platform_update_mesh(Platform *app, MeshHandle mesh_handle, const ObjectMesh
     return 0;
 }
 
-int platform_add_model(Platform *app, const Model *model, ModelHandle *model_handle)
-{
-    if (!app || !model || !model_handle || model->mesh_handle >= app->mesh_count ||
-        app->model_count >= UINT32_MAX) return -1;
-    for (uint32_t i = 0; i < 3; ++i)
-        if (!isfinite(model->base_color[i]) || !isfinite(model->rim_color[i]) ||
-            model->base_color[i] < 0.0f || model->rim_color[i] < 0.0f) return -1;
-    if (app->model_count == app->model_capacity) {
-        size_t capacity = app->model_capacity ? app->model_capacity * 2 : 4;
-        PlatformModel *models = realloc(app->models, capacity * sizeof(*models));
-        if (!models) return -1;
-        app->models = models;
-        app->model_capacity = capacity;
-    }
-    *model_handle = (ModelHandle)app->model_count;
-    app->models[app->model_count++] = (PlatformModel){.model = *model};
-    app->instances_dirty = 1;
-    return 0;
-}
-
-int platform_add_transform(Platform *app, const Transform *transform,
-                           TransformHandle *transform_handle)
-{
-    if (!app || !transform || !transform_handle ||
-        app->transform_count >= MAX_TRANSFORMS) return -1;
-    for (uint32_t i = 0; i < 3; ++i)
-        if (!isfinite(transform->position[i]) || !isfinite(transform->rotation[i])) return -1;
-    if (!isfinite(transform->rotation[3])) return -1;
-    if (app->transform_count == app->transform_capacity) {
-        size_t capacity = app->transform_capacity ? app->transform_capacity * 2 : 16;
-        TransformRecord *transforms = realloc(app->transforms, capacity * sizeof(*transforms));
-        if (!transforms) return -1;
-        app->transforms = transforms;
-        app->transform_capacity = capacity;
-    }
-    *transform_handle = (TransformHandle)app->transform_count;
-    app->transforms[app->transform_count++] =
-        (TransformRecord){.transform = *transform, .dirty = 1};
-    return 0;
-}
-
-int platform_update_transform(Platform *app, TransformHandle transform_handle,
-                              const Transform *transform)
-{
-    if (!app || !transform || transform_handle >= app->transform_count) return -1;
-    if (app->transforms[transform_handle].ant_owned) return -1;
-    for (uint32_t i = 0; i < 3; ++i)
-        if (!isfinite(transform->position[i]) || !isfinite(transform->rotation[i])) return -1;
-    if (!isfinite(transform->rotation[3])) return -1;
-    app->transforms[transform_handle].transform = *transform;
-    app->transforms[transform_handle].dirty = 1;
-    return 0;
-}
-
-int platform_add_drawable(Platform *app, ModelHandle model_handle,
-                          TransformHandle transform_handle)
-{
-    if (!app || model_handle >= app->model_count ||
-        transform_handle >= app->transform_count || app->drawable_count >= MAX_TRANSFORMS) return -1;
-    if (app->drawable_count == app->drawable_capacity) {
-        size_t capacity = app->drawable_capacity ? app->drawable_capacity * 2 : 16;
-        PlatformDrawable *drawables = realloc(app->drawables, capacity * sizeof(*drawables));
-        if (!drawables) return -1;
-        app->drawables = drawables;
-        app->drawable_capacity = capacity;
-    }
-    app->drawables[app->drawable_count++] = (PlatformDrawable){model_handle, transform_handle};
-    app->instances_dirty = 1;
-    return 0;
-}
-
-int platform_add_antable(Platform *app, TransformHandle surface_transform,
+int render_add_antable(Platform *app, TransformHandle surface_transform,
                          const ObjectNavMesh *navmesh, const Ant *ants,
                          size_t ant_count)
 {
@@ -467,140 +272,10 @@ int platform_add_antable(Platform *app, TransformHandle surface_transform,
         app->swarm_capacity = capacity;
     }
 
-    GpuTriangle *triangles = calloc(triangle_count, sizeof(*triangles));
-    GpuAnt *gpu_ants = calloc(ant_count, sizeof(*gpu_ants));
-    if (!triangles || !gpu_ants) {
-        free(triangles);
-        free(gpu_ants);
-        return -1;
-    }
-    for (uint32_t triangle = 0; triangle < triangle_count; ++triangle) {
-        for (uint32_t vertex = 0; vertex < 3; ++vertex) {
-            uint32_t index = navmesh->mesh.indices[triangle * 3 + vertex];
-            uint32_t neighbor = navmesh->neighbors[triangle * 3 + vertex];
-            if (index >= navmesh->mesh.vertex_count ||
-                (neighbor != OBJECT_NAVMESH_NO_NEIGHBOR && neighbor >= triangle_count)) {
-                free(triangles);
-                free(gpu_ants);
-                return -1;
-            }
-            memcpy(triangles[triangle].vertices[vertex],
-                   navmesh->mesh.vertices[index].position, sizeof(float) * 3);
-            triangles[triangle].vertices[vertex][3] = 1.0f;
-            triangles[triangle].neighbors[vertex] = neighbor;
-            if (neighbor != OBJECT_NAVMESH_NO_NEIGHBOR) {
-                uint32_t edge_a = navmesh->mesh.indices[triangle * 3 + vertex];
-                uint32_t edge_b = navmesh->mesh.indices[triangle * 3 + (vertex + 1) % 3];
-                int reciprocal = 0;
-                for (uint32_t neighbor_edge = 0; neighbor_edge < 3; ++neighbor_edge) {
-                    uint32_t neighbor_a = navmesh->mesh.indices[neighbor * 3 + neighbor_edge];
-                    uint32_t neighbor_b = navmesh->mesh.indices[neighbor * 3 + (neighbor_edge + 1) % 3];
-                    if (((edge_a == neighbor_a && edge_b == neighbor_b) ||
-                         (edge_a == neighbor_b && edge_b == neighbor_a)) &&
-                        navmesh->neighbors[neighbor * 3 + neighbor_edge] == triangle) {
-                        reciprocal = 1;
-                        break;
-                    }
-                }
-                if (!reciprocal) {
-                    free(triangles);
-                    free(gpu_ants);
-                    return -1;
-                }
-            }
-        }
-        float *a = triangles[triangle].vertices[0];
-        float *b = triangles[triangle].vertices[1];
-        float *c = triangles[triangle].vertices[2];
-        float ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-        float ac[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-        float normal[3] = {
-            ab[1] * ac[2] - ab[2] * ac[1],
-            ab[2] * ac[0] - ab[0] * ac[2],
-            ab[0] * ac[1] - ab[1] * ac[0]
-        };
-        float area_squared = normal[0] * normal[0] + normal[1] * normal[1]
-            + normal[2] * normal[2];
-        if (!isfinite(area_squared) || area_squared < 1e-16f) {
-            free(triangles);
-            free(gpu_ants);
-            return -1;
-        }
-        triangles[triangle].neighbors[3] = OBJECT_NAVMESH_NO_NEIGHBOR;
-    }
-    for (size_t i = 0; i < ant_count; ++i) {
-        if (ants[i].transform_handle >= app->transform_count ||
-            ants[i].transform_handle == surface_transform ||
-            app->transforms[ants[i].transform_handle].ant_owned ||
-            app->transforms[ants[i].transform_handle].ant_surface ||
-            ants[i].current_triangle >= triangle_count || !isfinite(ants[i].speed) ||
-            ants[i].speed < 0.0f ||
-            !isfinite(ants[i].position[0]) || !isfinite(ants[i].position[1]) ||
-            !isfinite(ants[i].position[2]) || !isfinite(ants[i].tangent[0]) ||
-            !isfinite(ants[i].tangent[1]) || !isfinite(ants[i].tangent[2]) ||
-            (ants[i].tangent[0] == 0.0f && ants[i].tangent[1] == 0.0f &&
-             ants[i].tangent[2] == 0.0f)) {
-            free(triangles);
-            free(gpu_ants);
-            return -1;
-        }
-        for (size_t j = 0; j < i; ++j) {
-            if (ants[j].transform_handle == ants[i].transform_handle) {
-                free(triangles);
-                free(gpu_ants);
-                return -1;
-            }
-        }
-        const GpuTriangle *triangle = &triangles[ants[i].current_triangle];
-        const float *a = triangle->vertices[0];
-        const float *b = triangle->vertices[1];
-        const float *c = triangle->vertices[2];
-        float v0[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-        float v1[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-        float v2[3] = {ants[i].position[0] - a[0], ants[i].position[1] - a[1],
-                       ants[i].position[2] - a[2]};
-        float d00 = v0[0] * v0[0] + v0[1] * v0[1] + v0[2] * v0[2];
-        float d01 = v0[0] * v1[0] + v0[1] * v1[1] + v0[2] * v1[2];
-        float d11 = v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2];
-        float d20 = v2[0] * v0[0] + v2[1] * v0[1] + v2[2] * v0[2];
-        float d21 = v2[0] * v1[0] + v2[1] * v1[1] + v2[2] * v1[2];
-        float denominator = d00 * d11 - d01 * d01;
-        float bary_y = (d11 * d20 - d01 * d21) / denominator;
-        float bary_z = (d00 * d21 - d01 * d20) / denominator;
-        float bary_x = 1.0f - bary_y - bary_z;
-        float normal[3] = {
-            v0[1] * v1[2] - v0[2] * v1[1],
-            v0[2] * v1[0] - v0[0] * v1[2],
-            v0[0] * v1[1] - v0[1] * v1[0]
-        };
-        float tangent_dot_normal = ants[i].tangent[0] * normal[0]
-            + ants[i].tangent[1] * normal[1] + ants[i].tangent[2] * normal[2];
-        float tangent_cross_squared = 0.0f;
-        for (uint32_t axis = 0; axis < 3; ++axis) {
-            float projected = ants[i].tangent[axis]
-                - normal[axis] * tangent_dot_normal /
-                  (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
-            tangent_cross_squared += projected * projected;
-        }
-        float normal_length = sqrtf(normal[0] * normal[0] + normal[1] * normal[1]
-            + normal[2] * normal[2]);
-        float plane_distance = fabsf(v2[0] * normal[0] + v2[1] * normal[1]
-            + v2[2] * normal[2]) / normal_length;
-        float triangle_scale = sqrtf(fmaxf(d00, d11));
-        if (bary_x < -1e-4f || bary_y < -1e-4f || bary_z < -1e-4f ||
-            !isfinite(bary_x) || !isfinite(bary_y) || !isfinite(bary_z) ||
-            !isfinite(tangent_cross_squared) || tangent_cross_squared < 1e-12f ||
-            !isfinite(plane_distance) || plane_distance > triangle_scale * 1e-4f) {
-            free(triangles);
-            free(gpu_ants);
-            return -1;
-        }
-        gpu_ants[i].data[0] = ants[i].transform_handle;
-        gpu_ants[i].data[1] = ants[i].current_triangle;
-        memcpy(gpu_ants[i].position_speed, ants[i].position, sizeof(ants[i].position));
-        gpu_ants[i].position_speed[3] = ants[i].speed;
-        memcpy(gpu_ants[i].tangent, ants[i].tangent, sizeof(ants[i].tangent));
-    }
+    GpuTriangle *triangles = NULL;
+    GpuAnt *gpu_ants = NULL;
+    if (render_build_ant_buffers(app, surface_transform, navmesh, ants, ant_count,
+                                 triangle_count, &triangles, &gpu_ants)) return -1;
 
     AntSwarm swarm = {0};
     int result = create_buffer(app, (VkDeviceSize)triangle_count * sizeof(*triangles),
@@ -658,13 +333,6 @@ int platform_add_antable(Platform *app, TransformHandle surface_transform,
         app->transforms[ants[i].transform_handle].ant_owned = 1;
     app->ants_need_dispatch = 1;
     return 0;
-}
-
-void platform_step_ants(Platform *app, float delta_seconds)
-{
-    if (!app || !isfinite(delta_seconds) || delta_seconds <= 0.0f) return;
-    app->swarm_delta_seconds += delta_seconds;
-    if (app->swarm_delta_seconds > 0.1f) app->swarm_delta_seconds = 0.1f;
 }
 
 static VkSurfaceFormatKHR choose_surface_format(const VkSurfaceFormatKHR *formats, uint32_t count)
@@ -1111,14 +779,6 @@ static int record_commands(Platform *app, uint32_t image_index, const Scene *sce
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (vk_error(vkBeginCommandBuffer(app->command_buffer, &begin), "begin command buffer")) return -1;
     if ((app->swarm_delta_seconds > 0.0f || app->ants_need_dispatch) && app->swarm_count) {
-        typedef struct AntUpdate {
-            float delta_seconds;
-            float surface_offset;
-            uint32_t ant_count;
-            uint32_t triangle_count;
-            uint32_t surface_transform;
-            uint32_t padding[3];
-        } AntUpdate;
         vkCmdBindPipeline(app->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                           app->compute_pipeline);
         for (size_t i = 0; i < app->swarm_count; ++i) {
@@ -1185,7 +845,7 @@ static int record_commands(Platform *app, uint32_t image_index, const Scene *sce
     return vk_error(vkEndCommandBuffer(app->command_buffer), "end command buffer");
 }
 
-int platform_draw(Platform *app, const Scene *scene)
+int render_draw(Platform *app, const Scene *scene)
 {
     if (!app || !scene) return -1;
     if (app->framebuffer_resized && recreate_swapchain(app)) return -1;

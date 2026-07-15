@@ -1,6 +1,7 @@
 #include "app.h"
 #include "object.h"
 #include "platform.h"
+#include "render.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -169,7 +170,7 @@ static int add_ant_swarms(App *app)
         ObjectMesh ant_mesh = {0};
         MeshHandle mesh_handle;
         if (create_ant_mesh(&ant_mesh, variant) ||
-            platform_add_mesh(app->platform, &ant_mesh, &mesh_handle)) {
+            render_add_mesh(app->platform, &ant_mesh, &mesh_handle)) {
             object_mesh_destroy(&ant_mesh);
             object_navmesh_destroy(&navmesh);
             return -1;
@@ -178,7 +179,7 @@ static int add_ant_swarms(App *app)
         Model model = {.mesh_handle = mesh_handle};
         memcpy(model.base_color, base_colors[variant], sizeof(model.base_color));
         memcpy(model.rim_color, rim_colors[variant], sizeof(model.rim_color));
-        if (platform_add_model(app->platform, &model, &app->ant_models[variant])) {
+        if (render_add_model(app->platform, &model, &app->ant_models[variant])) {
             object_navmesh_destroy(&navmesh);
             return -1;
         }
@@ -219,14 +220,14 @@ static int add_ant_swarms(App *app)
             ants[i].current_triangle = triangle;
             ants[i].speed = 0.18f + 0.06f * (float)(i % 7) / 6.0f;
             Transform transform = {.rotation = {0.0f, 0.0f, 0.0f, 1.0f}};
-            if (platform_add_transform(app->platform, &transform, &ants[i].transform_handle) ||
-                platform_add_drawable(app->platform, app->ant_models[(i + surface) % 3],
+            if (render_add_transform(app->platform, &transform, &ants[i].transform_handle) ||
+                render_add_drawable(app->platform, app->ant_models[(i + surface) % 3],
                                       ants[i].transform_handle)) {
                 object_navmesh_destroy(&navmesh);
                 return -1;
             }
         }
-        if (platform_add_antable(app->platform, app->teapot_transforms[surface], &navmesh,
+        if (render_add_antable(app->platform, app->teapot_transforms[surface], &navmesh,
             ants, ANTS_PER_TEAPOT)) {
             object_navmesh_destroy(&navmesh);
             return -1;
@@ -244,16 +245,16 @@ static int load_mesh(App *app)
         return -1;
     }
     int result;
-    if (app->mesh_loaded) result = platform_update_mesh(app->platform, app->teapot_mesh, &mesh);
+    if (app->mesh_loaded) result = render_update_mesh(app->platform, app->teapot_mesh, &mesh);
     else {
-        result = platform_add_mesh(app->platform, &mesh, &app->teapot_mesh);
+        result = render_add_mesh(app->platform, &mesh, &app->teapot_mesh);
         if (!result) {
             Model model = {
                 .mesh_handle = app->teapot_mesh,
                 .base_color = {0.72f, 0.25f, 0.10f},
                 .rim_color = {0.35f, 0.12f, 0.05f}
             };
-            result = platform_add_model(app->platform, &model, &app->teapot_model);
+            result = render_add_model(app->platform, &model, &app->teapot_model);
             if (!result) app->mesh_loaded = 1;
         }
     }
@@ -294,7 +295,7 @@ static int update_transforms(const App *app, float seconds)
         transform.rotation[1] = sinf(half_angle);
         transform.rotation[3] = cosf(half_angle);
         memcpy(transform.position, TEAPOT_POSITIONS[i], sizeof(transform.position));
-        if (platform_update_transform(app->platform, app->teapot_transforms[i], &transform)) return -1;
+        if (render_update_transform(app->platform, app->teapot_transforms[i], &transform)) return -1;
     }
     return 0;
 }
@@ -315,8 +316,8 @@ int app_run(const char *asset_path)
         transform.rotation[1] = sinf(half_angle);
         transform.rotation[3] = cosf(half_angle);
         memcpy(transform.position, TEAPOT_POSITIONS[i], sizeof(transform.position));
-        if (platform_add_transform(app.platform, &transform, &app.teapot_transforms[i]) ||
-            platform_add_drawable(app.platform, app.teapot_model, app.teapot_transforms[i])) {
+        if (render_add_transform(app.platform, &transform, &app.teapot_transforms[i]) ||
+            render_add_drawable(app.platform, app.teapot_model, app.teapot_transforms[i])) {
             platform_destroy(app.platform);
             return EXIT_FAILURE;
         }
@@ -339,8 +340,8 @@ int app_run(const char *asset_path)
         previous_seconds = seconds;
         Scene scene = {0};
         update_scene(&app, &input, seconds, &scene);
-        platform_step_ants(app.platform, delta_seconds);
-        if (update_transforms(&app, seconds) || platform_draw(app.platform, &scene)) {
+        render_step_ants(app.platform, delta_seconds);
+        if (update_transforms(&app, seconds) || render_draw(app.platform, &scene)) {
             failed = 1;
             break;
         }

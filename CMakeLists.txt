@@ -38,6 +38,7 @@ target_link_libraries(navmesh_tool PRIVATE object_mesh)
 add_executable(vulkan_teapot
     src/main.c
     src/app.c
+    src/render.c
     src/platform.c)
 add_dependencies(vulkan_teapot object_shaders)
 target_include_directories(vulkan_teapot PRIVATE include)

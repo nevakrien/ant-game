@@ -36,9 +36,9 @@ press Escape to exit.
 
 ## Drawing meshes
 
-Meshes are uploaded once with `platform_add_mesh()` and kept in the renderer's
-mesh registry. Transforms are stored separately with `platform_add_transform()`
-and updated with `platform_update_transform()`. `platform_add_drawable()` pairs
+Meshes are uploaded once with `render_add_mesh()` and kept in the renderer's
+mesh registry. Transforms are stored separately with `render_add_transform()`
+and updated with `render_update_transform()`. `render_add_drawable()` pairs
 a mesh handle with a transform handle for rendering. This keeps mesh selection
 out of simulation-facing transform handles while still letting multiple meshes
 share one transform. Transforms live in one GPU storage buffer, and a zero
@@ -46,10 +46,10 @@ quaternion is treated as the identity rotation.
 
 ## Antable objects
 
-`platform_add_antable()` associates one surface transform with a navmesh and a
+`render_add_antable()` associates one surface transform with a navmesh and a
 buffer of compact ant tokens. The container stores the surface handle and
 navmesh once. Each token contains only its rendered transform handle, current
-triangle, speed, navmesh-local position, and tangent. `platform_step_ants()`
+triangle, speed, navmesh-local position, and tangent. `render_step_ants()`
 queues elapsed time for the next draw. Before the render pass, the ant compute
 shader traverses triangle neighbors, parallel-transports each tangent across
 folds, composes the local ant pose with the current surface transform, and
