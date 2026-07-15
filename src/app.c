@@ -1,5 +1,5 @@
 #include "app.h"
-#include "teapot.h"
+#include "object.h"
 
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -13,11 +13,11 @@
 #include <sys/stat.h>
 #include <time.h>
 
-#ifndef TEAPOT_SHADER_DIR
-#define TEAPOT_SHADER_DIR "shaders"
+#ifndef OBJECT_SHADER_DIR
+#define OBJECT_SHADER_DIR "shaders"
 #endif
-#ifndef TEAPOT_ASSET_PATH
-#define TEAPOT_ASSET_PATH "assets/teapot.obj"
+#ifndef DEFAULT_OBJECT_PATH
+#define DEFAULT_OBJECT_PATH "assets/teapot.obj"
 #endif
 
 typedef struct App {
@@ -295,11 +295,11 @@ static void destroy_mesh_buffers(App *app)
 
 static int create_mesh_buffers(App *app, const char *path)
 {
-    TeapotMesh mesh;
+    ObjectMesh mesh;
     VkBuffer vertex_buffer = VK_NULL_HANDLE, index_buffer = VK_NULL_HANDLE;
     VkDeviceMemory vertex_memory = VK_NULL_HANDLE, index_memory = VK_NULL_HANDLE;
-    if (teapot_mesh_load_obj(path, &mesh)) {
-        fprintf(stderr, "Could not load teapot mesh\n");
+    if (object_mesh_load_obj_file(path, &mesh)) {
+        fprintf(stderr, "Could not load OBJ mesh: %s\n", path);
         return -1;
     }
     int result = create_buffer(app, (VkDeviceSize)mesh.vertex_count * sizeof(*mesh.vertices),
@@ -323,7 +323,7 @@ static int create_mesh_buffers(App *app, const char *path)
         vkDestroyBuffer(app->device, vertex_buffer, NULL);
         vkFreeMemory(app->device, vertex_memory, NULL);
     }
-    teapot_mesh_destroy(&mesh);
+    object_mesh_destroy(&mesh);
     return result;
 }
 
@@ -485,7 +485,7 @@ static int create_render_pass(App *app)
 static int read_shader(const char *name, uint32_t **code, size_t *size)
 {
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s.spv", TEAPOT_SHADER_DIR, name);
+    snprintf(path, sizeof(path), "%s/%s.spv", OBJECT_SHADER_DIR, name);
     FILE *file = fopen(path, "rb");
     if (!file) { fprintf(stderr, "Could not open shader %s\n", path); return -1; }
     if (fseek(file, 0, SEEK_END) || (*size = (size_t)ftell(file)) == 0 || fseek(file, 0, SEEK_SET)) {
@@ -501,7 +501,7 @@ static int create_pipeline(App *app)
 {
     uint32_t *vertex_code = NULL, *fragment_code = NULL;
     size_t vertex_size = 0, fragment_size = 0;
-    if (read_shader("teapot.vert", &vertex_code, &vertex_size) || read_shader("teapot.frag", &fragment_code, &fragment_size)) {
+    if (read_shader("object.vert", &vertex_code, &vertex_size) || read_shader("object.frag", &fragment_code, &fragment_size)) {
         free(vertex_code); free(fragment_code); return -1;
     }
     VkShaderModuleCreateInfo module_info = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -519,10 +519,10 @@ static int create_pipeline(App *app)
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
          .module = fragment_module, .pName = "main"}
     };
-    VkVertexInputBindingDescription binding = {.binding = 0, .stride = sizeof(TeapotVertex), .inputRate = VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputBindingDescription binding = {.binding = 0, .stride = sizeof(ObjectVertex), .inputRate = VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[2] = {
-        {.location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(TeapotVertex, position)},
-        {.location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(TeapotVertex, normal)}
+        {.location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(ObjectVertex, position)},
+        {.location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(ObjectVertex, normal)}
     };
     VkPipelineVertexInputStateCreateInfo vertex_input = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &binding,
@@ -713,7 +713,7 @@ static void cleanup(App *app)
 int app_run(const char *asset_path)
 {
     App app = {0};
-    app.asset_path = asset_path ? asset_path : TEAPOT_ASSET_PATH;
+    app.asset_path = asset_path ? asset_path : DEFAULT_OBJECT_PATH;
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return EXIT_FAILURE;

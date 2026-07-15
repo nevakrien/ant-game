@@ -10,10 +10,12 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 
+include(CTest)
+
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 
-foreach(shader teapot.vert teapot.frag)
+foreach(shader object.vert object.frag)
     add_custom_command(
         OUTPUT "${SHADER_OUTPUT_DIR}/${shader}.spv"
         COMMAND "${GLSLANG_VALIDATOR}" -V
@@ -24,20 +26,33 @@ foreach(shader teapot.vert teapot.frag)
     list(APPEND SHADER_BINARIES "${SHADER_OUTPUT_DIR}/${shader}.spv")
 endforeach()
 
-add_custom_target(teapot_shaders DEPENDS ${SHADER_BINARIES})
+add_custom_target(object_shaders DEPENDS ${SHADER_BINARIES})
+
+add_library(object_mesh STATIC src/object.c)
+target_include_directories(object_mesh PUBLIC include)
+target_link_libraries(object_mesh PUBLIC m)
 
 add_executable(vulkan_teapot
     src/main.c
-    src/app.c
-    src/teapot.c)
-add_dependencies(vulkan_teapot teapot_shaders)
+    src/app.c)
+add_dependencies(vulkan_teapot object_shaders)
 target_include_directories(vulkan_teapot PRIVATE include)
 target_compile_definitions(vulkan_teapot PRIVATE
-    TEAPOT_SHADER_DIR="${SHADER_OUTPUT_DIR}"
-    TEAPOT_ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj")
+    OBJECT_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    DEFAULT_OBJECT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj")
 target_link_libraries(vulkan_teapot PRIVATE
-    Vulkan::Vulkan PkgConfig::SDL2 m)
+    object_mesh Vulkan::Vulkan PkgConfig::SDL2)
+
+if(BUILD_TESTING)
+    add_executable(object_mesh_test tests/object_test.c)
+    target_link_libraries(object_mesh_test PRIVATE object_mesh)
+    add_test(NAME object_mesh_test COMMAND object_mesh_test "${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj")
+endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(object_mesh PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(vulkan_teapot PRIVATE -Wall -Wextra -Wpedantic)
+    if(BUILD_TESTING)
+        target_compile_options(object_mesh_test PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()

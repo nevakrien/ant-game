@@ -33,3 +33,11 @@ Pass another OBJ as the first argument to render a Blender export:
 The teapot rotates automatically. The OBJ file's modification time is checked
 twice per second and successfully saved changes are hot reloaded. Resize or
 maximize the window to exercise swapchain recreation; press Escape to exit.
+
+## OBJ loader
+
+The reusable loader is exposed by `include/object.h`. Use
+`object_mesh_load_obj_file()` for a path, or `object_mesh_load_obj_data()` for
+a `char *` and byte count. The latter does not require null-terminated input.
+Both return an `ObjectMesh` owned by the caller and released with
+`object_mesh_destroy()`.

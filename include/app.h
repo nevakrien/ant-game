@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-/* Pass NULL to use the teapot asset configured by the build. */
+/* Pass NULL to use the default OBJ asset configured by the build. */
 int app_run(const char *asset_path);
 
 #ifdef __cplusplus
