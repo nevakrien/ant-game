@@ -67,6 +67,11 @@ if(BUILD_TESTING)
     add_test(NAME object_mesh_test COMMAND object_mesh_test
              "${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj"
              "${CMAKE_CURRENT_BINARY_DIR}/object_test.nav")
+
+    add_executable(ant_animation_test tests/ant_animation_test.c src/render.c)
+    target_include_directories(ant_animation_test PRIVATE include src)
+    target_link_libraries(ant_animation_test PRIVATE Vulkan::Vulkan PkgConfig::SDL2 m)
+    add_test(NAME ant_animation_test COMMAND ant_animation_test)
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -75,5 +80,6 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(vulkan_teapot PRIVATE -Wall -Wextra -Wpedantic)
     if(BUILD_TESTING)
         target_compile_options(object_mesh_test PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(ant_animation_test PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endif()

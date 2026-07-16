@@ -5,6 +5,148 @@
 #include <stdlib.h>
 #include <string.h>
 
+static float vector_dot(const float a[3], const float b[3])
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void vector_cross(float out[3], const float a[3], const float b[3])
+{
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static int vector_normalize(float value[3])
+{
+    float length_squared = vector_dot(value, value);
+    if (!isfinite(length_squared) || length_squared < 1e-12f) return -1;
+    float inverse_length = 1.0f / sqrtf(length_squared);
+    for (uint32_t axis = 0; axis < 3; ++axis) value[axis] *= inverse_length;
+    return 0;
+}
+
+static void rotate_vector(float out[3], const float rotation[4], const float value[3])
+{
+    float q[4];
+    memcpy(q, rotation, sizeof(q));
+    float length_squared = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if (length_squared < 1e-12f) {
+        memcpy(out, value, sizeof(float) * 3);
+        return;
+    }
+    float inverse_length = 1.0f / sqrtf(length_squared);
+    for (uint32_t i = 0; i < 4; ++i) q[i] *= inverse_length;
+    float q_vector[3] = {q[0], q[1], q[2]};
+    float first_cross[3], second_cross[3], intermediate[3];
+    vector_cross(first_cross, q_vector, value);
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        intermediate[axis] = first_cross[axis] + q[3] * value[axis];
+    vector_cross(second_cross, q_vector, intermediate);
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        out[axis] = value[axis] + 2.0f * second_cross[axis];
+}
+
+static void quaternion_from_basis(float out[4], const float x[3], const float y[3],
+                                  const float z[3])
+{
+    float trace = x[0] + y[1] + z[2];
+    if (trace > 0.0f) {
+        float s = sqrtf(trace + 1.0f) * 2.0f;
+        out[0] = (y[2] - z[1]) / s;
+        out[1] = (z[0] - x[2]) / s;
+        out[2] = (x[1] - y[0]) / s;
+        out[3] = 0.25f * s;
+    } else if (x[0] > y[1] && x[0] > z[2]) {
+        float s = sqrtf(1.0f + x[0] - y[1] - z[2]) * 2.0f;
+        out[0] = 0.25f * s;
+        out[1] = (x[1] + y[0]) / s;
+        out[2] = (x[2] + z[0]) / s;
+        out[3] = (y[2] - z[1]) / s;
+    } else if (y[1] > z[2]) {
+        float s = sqrtf(1.0f + y[1] - x[0] - z[2]) * 2.0f;
+        out[0] = (x[1] + y[0]) / s;
+        out[1] = 0.25f * s;
+        out[2] = (y[2] + z[1]) / s;
+        out[3] = (z[0] - x[2]) / s;
+    } else {
+        float s = sqrtf(1.0f + z[2] - x[0] - y[1]) * 2.0f;
+        out[0] = (x[2] + z[0]) / s;
+        out[1] = (y[2] + z[1]) / s;
+        out[2] = 0.25f * s;
+        out[3] = (x[1] - y[0]) / s;
+    }
+    float length = sqrtf(out[0] * out[0] + out[1] * out[1]
+        + out[2] * out[2] + out[3] * out[3]);
+    for (uint32_t i = 0; i < 4; ++i) out[i] /= length;
+}
+
+static int plane_world_pose(const Platform *platform, const AntPlane *plane,
+                            float position[3], float rotation[4], float normal[3])
+{
+    float forward[3];
+    if (plane->transform_handle == ANT_WORLD_PLANE_TRANSFORM) {
+        memcpy(position, plane->position, sizeof(plane->position));
+        memcpy(normal, plane->normal, sizeof(plane->normal));
+        memcpy(forward, plane->forward, sizeof(plane->forward));
+    } else {
+        const Transform *parent = &platform->transforms[plane->transform_handle].transform;
+        rotate_vector(position, parent->rotation, plane->position);
+        for (uint32_t axis = 0; axis < 3; ++axis) position[axis] += parent->position[axis];
+        rotate_vector(normal, parent->rotation, plane->normal);
+        rotate_vector(forward, parent->rotation, plane->forward);
+    }
+    if (vector_normalize(normal)) return -1;
+    float along_normal = vector_dot(forward, normal);
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        forward[axis] -= normal[axis] * along_normal;
+    if (vector_normalize(forward)) return -1;
+    float right[3];
+    vector_cross(right, normal, forward);
+    if (vector_normalize(right)) return -1;
+    quaternion_from_basis(rotation, right, normal, forward);
+    return 0;
+}
+
+static int valid_plane(const Platform *platform, const AntPlane *plane)
+{
+    if (!plane || (plane->transform_handle != ANT_WORLD_PLANE_TRANSFORM &&
+        plane->transform_handle >= platform->transform_count)) return 0;
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        if (!isfinite(plane->position[axis]) || !isfinite(plane->normal[axis]) ||
+            !isfinite(plane->forward[axis])) return 0;
+    float normal[3], rotation[4], position[3];
+    return plane_world_pose(platform, plane, position, rotation, normal) == 0;
+}
+
+static void quaternion_slerp(float out[4], const float start[4], const float end[4], float t)
+{
+    float adjusted_end[4];
+    memcpy(adjusted_end, end, sizeof(adjusted_end));
+    float dot = start[0] * end[0] + start[1] * end[1]
+        + start[2] * end[2] + start[3] * end[3];
+    if (dot < 0.0f) {
+        dot = -dot;
+        for (uint32_t i = 0; i < 4; ++i) adjusted_end[i] = -adjusted_end[i];
+    }
+    if (dot > 0.9995f) {
+        float length_squared = 0.0f;
+        for (uint32_t i = 0; i < 4; ++i) {
+            out[i] = start[i] + (adjusted_end[i] - start[i]) * t;
+            length_squared += out[i] * out[i];
+        }
+        float inverse_length = 1.0f / sqrtf(length_squared);
+        for (uint32_t i = 0; i < 4; ++i) out[i] *= inverse_length;
+        return;
+    }
+    float angle = acosf(fminf(dot, 1.0f));
+    float inverse_sine = 1.0f / sinf(angle);
+    float start_weight = sinf((1.0f - t) * angle) * inverse_sine;
+    float end_weight = sinf(t * angle) * inverse_sine;
+    for (uint32_t i = 0; i < 4; ++i)
+        out[i] = start[i] * start_weight + adjusted_end[i] * end_weight;
+}
+
 int render_add_model(Platform *platform, const Model *model, ModelHandle *model_handle)
 {
     if (!platform || !model || !model_handle || model->mesh_handle >= platform->mesh_count ||
@@ -85,6 +227,120 @@ void render_step_ants(Platform *platform, float delta_seconds)
     if (!platform || !isfinite(delta_seconds) || delta_seconds <= 0.0f) return;
     platform->swarm_delta_seconds += delta_seconds;
     if (platform->swarm_delta_seconds > 0.1f) platform->swarm_delta_seconds = 0.1f;
+}
+
+int render_animate_ant_between_planes(Platform *platform, TransformHandle ant_transform,
+                                      const AntPlane *source, const AntPlane *destination,
+                                      float duration_seconds, float jump_height,
+                                      AntAnimationHandle *animation_handle)
+{
+    if (!platform || !animation_handle || ant_transform >= platform->transform_count ||
+        !platform->transforms[ant_transform].ant_owned || !valid_plane(platform, source) ||
+        !valid_plane(platform, destination) || source->transform_handle == ant_transform ||
+        destination->transform_handle == ant_transform || !isfinite(duration_seconds) ||
+        duration_seconds <= 0.0f || !isfinite(jump_height) || jump_height < 0.0f ||
+        platform->ant_animation_count >= UINT32_MAX) return -1;
+
+    if (platform->ant_animation_count == platform->ant_animation_capacity) {
+        size_t capacity = platform->ant_animation_capacity
+            ? platform->ant_animation_capacity * 2 : 8;
+        AntAnimation *animations = realloc(platform->ant_animations,
+                                            capacity * sizeof(*animations));
+        if (!animations) return -1;
+        platform->ant_animations = animations;
+        platform->ant_animation_capacity = capacity;
+    }
+    for (size_t i = 0; i < platform->ant_animation_count; ++i) {
+        AntAnimation *animation = &platform->ant_animations[i];
+        if (animation->ant_transform != ant_transform) continue;
+        if (animation->status != ANT_ANIMATION_FINISHED) return -1;
+        animation->holds_transform = 0;
+    }
+
+    *animation_handle = (AntAnimationHandle)platform->ant_animation_count;
+    platform->ant_animations[platform->ant_animation_count++] = (AntAnimation){
+        .ant_transform = ant_transform,
+        .source = *source,
+        .destination = *destination,
+        .duration_seconds = duration_seconds,
+        .jump_height = jump_height,
+        .status = ANT_ANIMATION_PENDING,
+        .holds_transform = 1
+    };
+    return 0;
+}
+
+int render_get_ant_animation_status(const Platform *platform,
+                                    AntAnimationHandle animation_handle,
+                                    AntAnimationStatus *status)
+{
+    if (!platform || !status || animation_handle >= platform->ant_animation_count) return -1;
+    *status = platform->ant_animations[animation_handle].status;
+    return 0;
+}
+
+static int remove_swarm_ant(Platform *platform, TransformHandle ant_transform)
+{
+    for (size_t swarm_index = 0; swarm_index < platform->swarm_count; ++swarm_index) {
+        AntSwarm *swarm = &platform->swarms[swarm_index];
+        GpuAnt *ants = NULL;
+        VkDeviceSize size = (VkDeviceSize)swarm->ant_count * sizeof(*ants);
+        if (!size) continue;
+        if (vkMapMemory(platform->device, swarm->ant_memory, 0, size, 0,
+                        (void **)&ants) != VK_SUCCESS) return -1;
+        for (uint32_t ant_index = 0; ant_index < swarm->ant_count; ++ant_index) {
+            if (ants[ant_index].data[0] != ant_transform) continue;
+            ants[ant_index] = ants[swarm->ant_count - 1];
+            --swarm->ant_count;
+            break;
+        }
+        vkUnmapMemory(platform->device, swarm->ant_memory);
+    }
+    return 0;
+}
+
+int render_update_ant_animations(Platform *platform, float delta_seconds)
+{
+    for (size_t i = 0; i < platform->ant_animation_count; ++i) {
+        AntAnimation *animation = &platform->ant_animations[i];
+        if (!animation->holds_transform) continue;
+        if (animation->status == ANT_ANIMATION_PENDING) {
+            if (remove_swarm_ant(platform, animation->ant_transform)) return -1;
+            animation->status = ANT_ANIMATION_RUNNING;
+        } else if (animation->status == ANT_ANIMATION_RUNNING) {
+            animation->elapsed_seconds += delta_seconds;
+            if (animation->elapsed_seconds >= animation->duration_seconds) {
+                animation->elapsed_seconds = animation->duration_seconds;
+                animation->status = ANT_ANIMATION_FINISHED;
+            }
+        }
+
+        float source_position[3], source_rotation[4], source_normal[3];
+        float destination_position[3], destination_rotation[4], destination_normal[3];
+        if (plane_world_pose(platform, &animation->source, source_position,
+                             source_rotation, source_normal) ||
+            plane_world_pose(platform, &animation->destination, destination_position,
+                             destination_rotation, destination_normal)) return -1;
+        float t = animation->status == ANT_ANIMATION_FINISHED ? 1.0f
+            : animation->elapsed_seconds / animation->duration_seconds;
+        float blend = t * t * (3.0f - 2.0f * t);
+        float arc_normal[3];
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            arc_normal[axis] = source_normal[axis] * (1.0f - blend)
+                + destination_normal[axis] * blend;
+        if (vector_normalize(arc_normal)) memcpy(arc_normal, source_normal, sizeof(arc_normal));
+
+        Transform transform;
+        float arc = sinf(3.14159265358979323846f * t) * animation->jump_height;
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            transform.position[axis] = source_position[axis]
+                + (destination_position[axis] - source_position[axis]) * blend
+                + arc_normal[axis] * arc;
+        quaternion_slerp(transform.rotation, source_rotation, destination_rotation, blend);
+        platform->transforms[animation->ant_transform].transform = transform;
+        platform->transforms[animation->ant_transform].dirty = 1;
+    }
+    return 0;
 }
 
 int render_build_ant_buffers(Platform *platform, TransformHandle surface_transform,

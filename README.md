@@ -35,7 +35,8 @@ does not calculate navmeshes during startup:
 
 Three instances of the teapot rotate automatically, each carrying a GPU-driven
 swarm of ants. Resize or maximize the window to exercise swapchain recreation;
-press Escape to exit.
+use W/S to pitch, A/D to yaw, and Q/E to roll. The arrow keys move the camera
+forward/back and left/right; Escape exits.
 
 ## Drawing meshes
 
@@ -62,6 +63,16 @@ rotating surface instances without a separate ant graphics pipeline.
 A future world-space token container can hold free-moving ants. Token transfer
 between that container and an antable would provide explicit attach and detach
 behavior without making every surface token carry a parent or navmesh handle.
+
+`render_animate_ant_between_planes()` removes an ant token from its current
+swarm and creates a renderer-owned transition record. No `Ant` token exists for
+it while it is off a navigable surface. Each endpoint is an `AntPlane`
+containing a contact position, normal, and forward direction. A plane can be
+local to a moving transform or use `ANT_WORLD_PLANE_TRANSFORM`, which is useful
+for a floor that has no triangle mesh. The ant follows a smooth jump arc and
+rotates between the two plane frames. `render_get_ant_animation_status()`
+reports when the jump is finished; finished ants remain held at the destination
+and continue to follow it if its transform moves.
 
 ## OBJ loader
 

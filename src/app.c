@@ -23,9 +23,19 @@ typedef struct App {
     ModelHandle teapot_model;
     ModelHandle ant_models[3];
     TransformHandle teapot_transforms[3];
+    TransformHandle showcase_ants[3];
+    AntPlane teapot_planes[3];
+    AntPlane floor_planes[3];
+    AntAnimationHandle showcase_animations[3];
+    float showcase_ready_times[3];
+    uint32_t showcase_surfaces[3];
+    int showcase_on_floor[3];
+    int showcase_waiting[3];
     int mesh_loaded;
     const char *asset_path;
     const char *navmesh_path;
+    float camera_position[3];
+    float camera_rotation[3];
     float light_direction[3];
     float light_update_time;
 } App;
@@ -39,6 +49,8 @@ static const float TEAPOT_POSITIONS[3][3] = {
 static const float TEAPOT_ANGLE_OFFSETS[3] = {-0.7f, 0.0f, 0.7f};
 
 enum { ANTS_PER_TEAPOT = 64 };
+
+static const float FLOOR_HEIGHT = -1.25f;
 
 static void mat4_identity(float m[16])
 {
@@ -71,17 +83,30 @@ static void mat4_perspective(float m[16], float aspect)
     m[14] = (far_plane * near_plane) / (near_plane - far_plane);
 }
 
-static void mat4_view(float m[16])
+static void mat4_view(float m[16], const float eye[3], const float rotation[3])
 {
-    const float eye[3] = {0.0f, 1.3f, 5.0f};
-    const float target[3] = {0.0f, 0.2f, 0.0f};
-    float f[3] = {target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]};
-    float length = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
-    f[0] /= length; f[1] /= length; f[2] /= length;
-    float s[3] = {-f[2], 0.0f, f[0]};
-    length = sqrtf(s[0] * s[0] + s[2] * s[2]);
-    s[0] /= length; s[2] /= length;
-    float u[3] = {s[2] * f[1], s[0] * f[2] - s[2] * f[0], -s[0] * f[1]};
+    float cos_pitch = cosf(rotation[0]);
+    float sin_pitch = sinf(rotation[0]);
+    float cos_yaw = cosf(rotation[1]);
+    float sin_yaw = sinf(rotation[1]);
+    float cos_roll = cosf(rotation[2]);
+    float sin_roll = sinf(rotation[2]);
+    float f[3] = {
+        cos_pitch * sin_yaw,
+        sin_pitch,
+        -cos_pitch * cos_yaw
+    };
+    float level_right[3] = {cos_yaw, 0.0f, sin_yaw};
+    float level_up[3] = {
+        -sin_pitch * sin_yaw,
+        cos_pitch,
+        sin_pitch * cos_yaw
+    };
+    float s[3], u[3];
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        s[axis] = level_right[axis] * cos_roll + level_up[axis] * sin_roll;
+        u[axis] = -(level_up[axis] * cos_roll - level_right[axis] * sin_roll);
+    }
 
     mat4_identity(m);
     m[0] = s[0]; m[4] = s[1]; m[8] = s[2];
@@ -150,6 +175,58 @@ static int create_ant_mesh(ObjectMesh *mesh, uint32_t variant)
     return 0;
 }
 
+static int add_floor(App *app)
+{
+    ObjectVertex vertices[4] = {
+        {.position = {-4.5f, FLOOR_HEIGHT, -2.5f}, .normal = {0.0f, 1.0f, 0.0f}},
+        {.position = { 4.5f, FLOOR_HEIGHT, -2.5f}, .normal = {0.0f, 1.0f, 0.0f}},
+        {.position = { 4.5f, FLOOR_HEIGHT,  2.0f}, .normal = {0.0f, 1.0f, 0.0f}},
+        {.position = {-4.5f, FLOOR_HEIGHT,  2.0f}, .normal = {0.0f, 1.0f, 0.0f}}
+    };
+    uint32_t indices[6] = {0, 2, 1, 0, 3, 2};
+    ObjectMesh mesh = {
+        .vertices = vertices,
+        .vertex_count = 4,
+        .indices = indices,
+        .index_count = 6
+    };
+    MeshHandle mesh_handle;
+    ModelHandle model_handle;
+    TransformHandle transform_handle;
+    Model model = {
+        .base_color = {0.12f, 0.17f, 0.20f},
+        .rim_color = {0.28f, 0.38f, 0.42f}
+    };
+    Transform transform = {.rotation = {0.0f, 0.0f, 0.0f, 1.0f}};
+    if (render_add_mesh(app->platform, &mesh, &mesh_handle)) return -1;
+    model.mesh_handle = mesh_handle;
+    if (render_add_model(app->platform, &model, &model_handle) ||
+        render_add_transform(app->platform, &transform, &transform_handle) ||
+        render_add_drawable(app->platform, model_handle, transform_handle)) return -1;
+    return 0;
+}
+
+static uint32_t find_showcase_triangle(const ObjectNavMesh *navmesh)
+{
+    uint32_t triangle_count = navmesh->mesh.index_count / 3;
+    uint32_t best_triangle = 0;
+    float best_height = -INFINITY;
+    for (uint32_t triangle = 0; triangle < triangle_count; ++triangle) {
+        const float *a = navmesh->mesh.vertices[navmesh->mesh.indices[triangle * 3]].position;
+        const float *b = navmesh->mesh.vertices[navmesh->mesh.indices[triangle * 3 + 1]].position;
+        const float *c = navmesh->mesh.vertices[navmesh->mesh.indices[triangle * 3 + 2]].position;
+        float ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        float ac[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        float normal_y = ab[2] * ac[0] - ab[0] * ac[2];
+        float height = (a[1] + b[1] + c[1]) / 3.0f;
+        if (normal_y > 0.0f && height > best_height) {
+            best_height = height;
+            best_triangle = triangle;
+        }
+    }
+    return best_triangle;
+}
+
 static int add_ant_swarms(App *app)
 {
     ObjectNavMesh navmesh = {0};
@@ -187,10 +264,12 @@ static int add_ant_swarms(App *app)
     }
 
     uint32_t triangle_count = navmesh.mesh.index_count / 3;
+    uint32_t showcase_triangle = find_showcase_triangle(&navmesh);
     for (uint32_t surface = 0; surface < 3; ++surface) {
         Ant ants[ANTS_PER_TEAPOT] = {0};
         for (uint32_t i = 0; i < ANTS_PER_TEAPOT; ++i) {
-            uint32_t triangle = (i * 97u + surface * 31u) % triangle_count;
+            uint32_t triangle = i == 0 ? showcase_triangle
+                : (i * 97u + surface * 31u) % triangle_count;
             const ObjectVertex *vertices[3];
             for (uint32_t corner = 0; corner < 3; ++corner)
                 vertices[corner] = &navmesh.mesh.vertices[navmesh.mesh.indices[triangle * 3 + corner]];
@@ -227,6 +306,18 @@ static int add_ant_swarms(App *app)
                 object_navmesh_destroy(&navmesh);
                 return -1;
             }
+            if (i == 0) {
+                float normal_length = sqrtf(normal[0] * normal[0] + normal[1] * normal[1]
+                    + normal[2] * normal[2]);
+                app->showcase_ants[surface] = ants[i].transform_handle;
+                app->teapot_planes[surface].transform_handle = app->teapot_transforms[surface];
+                memcpy(app->teapot_planes[surface].position, ants[i].position,
+                       sizeof(ants[i].position));
+                memcpy(app->teapot_planes[surface].forward, ants[i].tangent,
+                       sizeof(ants[i].tangent));
+                for (uint32_t axis = 0; axis < 3; ++axis)
+                    app->teapot_planes[surface].normal[axis] = normal[axis] / normal_length;
+            }
         }
         if (render_add_antable(app->platform, app->teapot_transforms[surface], &navmesh,
             ants, ANTS_PER_TEAPOT)) {
@@ -235,6 +326,65 @@ static int add_ant_swarms(App *app)
         }
     }
     object_navmesh_destroy(&navmesh);
+    return 0;
+}
+
+static int start_showcase(App *app)
+{
+    for (uint32_t i = 0; i < 3; ++i) {
+        app->floor_planes[i] = (AntPlane){
+            .transform_handle = ANT_WORLD_PLANE_TRANSFORM,
+            .position = {TEAPOT_POSITIONS[i][0], FLOOR_HEIGHT + 0.01f, 0.55f},
+            .normal = {0.0f, 1.0f, 0.0f},
+            .forward = {0.0f, 0.0f, 1.0f}
+        };
+        if (render_animate_ant_between_planes(app->platform, app->showcase_ants[i],
+            &app->teapot_planes[i], &app->floor_planes[i], 1.0f + 0.12f * i, 0.08f,
+            &app->showcase_animations[i])) return -1;
+        app->showcase_surfaces[i] = i;
+        app->showcase_on_floor[i] = 1;
+    }
+    return 0;
+}
+
+static int update_showcase(App *app, float seconds)
+{
+    for (uint32_t i = 0; i < 3; ++i) {
+        AntAnimationStatus status;
+        if (render_get_ant_animation_status(app->platform, app->showcase_animations[i],
+                                             &status)) return -1;
+        if (status != ANT_ANIMATION_FINISHED) continue;
+        if (!app->showcase_waiting[i]) {
+            app->showcase_waiting[i] = 1;
+            app->showcase_ready_times[i] = seconds + 0.55f + 0.18f * i;
+            continue;
+        }
+        if (seconds < app->showcase_ready_times[i]) continue;
+
+        uint32_t surface = app->showcase_surfaces[i];
+        const AntPlane *source;
+        const AntPlane *destination;
+        float duration;
+        float height;
+        if (app->showcase_on_floor[i]) {
+            surface = (surface + 1) % 3;
+            source = &app->floor_planes[app->showcase_surfaces[i]];
+            destination = &app->teapot_planes[surface];
+            duration = 1.35f;
+            height = 0.42f;
+            app->showcase_on_floor[i] = 0;
+            app->showcase_surfaces[i] = surface;
+        } else {
+            source = &app->teapot_planes[surface];
+            destination = &app->floor_planes[surface];
+            duration = 0.9f;
+            height = 0.06f;
+            app->showcase_on_floor[i] = 1;
+        }
+        if (render_animate_ant_between_planes(app->platform, app->showcase_ants[i],
+            source, destination, duration, height, &app->showcase_animations[i])) return -1;
+        app->showcase_waiting[i] = 0;
+    }
     return 0;
 }
 
@@ -281,7 +431,7 @@ static char *navmesh_path_for_object(const char *object_path)
 static void update_scene(App *app, const Input *input, float seconds, Scene *scene)
 {
     float view[16], projection[16];
-    mat4_view(view);
+    mat4_view(view, app->camera_position, app->camera_rotation);
     mat4_perspective(projection, platform_aspect_ratio(app->platform));
     mat4_multiply(scene->view_projection, projection, view);
 
@@ -303,6 +453,51 @@ static void update_scene(App *app, const Input *input, float seconds, Scene *sce
     app->light_update_time = seconds;
 }
 
+static void update_camera(App *app, const Input *input, float delta_seconds)
+{
+    float delta = fminf(delta_seconds, 0.1f);
+    float rotation_amount = 1.5f * delta;
+    app->camera_rotation[0] += (float)(input->pitch_up - input->pitch_down)
+        * rotation_amount;
+    app->camera_rotation[1] += (float)(input->yaw_right - input->yaw_left)
+        * rotation_amount;
+    app->camera_rotation[2] += (float)(input->roll_right - input->roll_left)
+        * rotation_amount;
+
+    float cos_pitch = cosf(app->camera_rotation[0]);
+    float sin_pitch = sinf(app->camera_rotation[0]);
+    float cos_yaw = cosf(app->camera_rotation[1]);
+    float sin_yaw = sinf(app->camera_rotation[1]);
+    float cos_roll = cosf(app->camera_rotation[2]);
+    float sin_roll = sinf(app->camera_rotation[2]);
+    float forward[3] = {
+        cos_pitch * sin_yaw,
+        sin_pitch,
+        -cos_pitch * cos_yaw
+    };
+    float level_right[3] = {cos_yaw, 0.0f, sin_yaw};
+    float level_up[3] = {
+        -sin_pitch * sin_yaw,
+        cos_pitch,
+        sin_pitch * cos_yaw
+    };
+    float right[3];
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        right[axis] = level_right[axis] * cos_roll + level_up[axis] * sin_roll;
+    float forward_amount = (float)(input->translate_forward - input->translate_backward);
+    float right_amount = (float)(input->translate_right - input->translate_left);
+    float movement[3];
+    float length_squared = 0.0f;
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        movement[axis] = forward[axis] * forward_amount + right[axis] * right_amount;
+        length_squared += movement[axis] * movement[axis];
+    }
+    if (length_squared <= 0.0f) return;
+    float distance = 4.5f * delta / sqrtf(length_squared);
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        app->camera_position[axis] += movement[axis] * distance;
+}
+
 static int update_transforms(const App *app, float seconds)
 {
     for (size_t i = 0; i < 3; ++i) {
@@ -322,13 +517,15 @@ int app_run(const char *asset_path)
     if (asset_path && !custom_navmesh_path) return EXIT_FAILURE;
     App app = {.asset_path = asset_path ? asset_path : DEFAULT_OBJECT_PATH,
                .navmesh_path = custom_navmesh_path ? custom_navmesh_path : DEFAULT_NAVMESH_PATH,
+               .camera_position = {0.0f, 1.3f, 5.0f},
+               .camera_rotation = {-0.2165503f, 0.0f, 0.0f},
                .light_direction = {0.0f, 0.0f, 1.0f}};
     app.platform = platform_create("Vulkan Utah Teapot", 1000, 720);
     if (!app.platform) {
         free(custom_navmesh_path);
         return EXIT_FAILURE;
     }
-    if (load_mesh(&app)) {
+    if (load_mesh(&app) || add_floor(&app)) {
         platform_destroy(app.platform);
         free(custom_navmesh_path);
         return EXIT_FAILURE;
@@ -352,6 +549,12 @@ int app_run(const char *asset_path)
         free(custom_navmesh_path);
         return EXIT_FAILURE;
     }
+    if (start_showcase(&app)) {
+        fprintf(stderr, "Could not create ant animation showcase\n");
+        platform_destroy(app.platform);
+        free(custom_navmesh_path);
+        return EXIT_FAILURE;
+    }
     struct timespec start;
     timespec_get(&start, TIME_UTC);
     int failed = 0;
@@ -364,9 +567,11 @@ int app_run(const char *asset_path)
         float delta_seconds = seconds - previous_seconds;
         previous_seconds = seconds;
         Scene scene = {0};
+        update_camera(&app, &input, delta_seconds);
         update_scene(&app, &input, seconds, &scene);
         render_step_ants(app.platform, delta_seconds);
-        if (update_transforms(&app, seconds) || render_draw(app.platform, &scene)) {
+        if (update_transforms(&app, seconds) || update_showcase(&app, seconds) ||
+            render_draw(app.platform, &scene)) {
             failed = 1;
             break;
         }

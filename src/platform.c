@@ -783,6 +783,7 @@ static int record_commands(Platform *app, uint32_t image_index, const Scene *sce
                           app->compute_pipeline);
         for (size_t i = 0; i < app->swarm_count; ++i) {
             const AntSwarm *swarm = &app->swarms[i];
+            if (!swarm->ant_count) continue;
             AntUpdate update = {
                 .delta_seconds = app->swarm_delta_seconds,
                 .surface_offset = 0.0f,
@@ -853,7 +854,8 @@ int render_draw(Platform *app, const Scene *scene)
     SDL_Vulkan_GetDrawableSize(app->window, &width, &height);
     if (width == 0 || height == 0) { SDL_Delay(20); return 0; }
     vkWaitForFences(app->device, 1, &app->frame_fence, VK_TRUE, UINT64_MAX);
-    if (upload_dirty_transforms(app) || upload_model_instances(app)) return -1;
+    if (render_update_ant_animations(app, app->swarm_delta_seconds) ||
+        upload_dirty_transforms(app) || upload_model_instances(app)) return -1;
     uint32_t image_index;
     VkResult result = vkAcquireNextImageKHR(app->device, app->swapchain, UINT64_MAX,
         app->image_available, VK_NULL_HANDLE, &image_index);
@@ -893,6 +895,7 @@ static void cleanup(Platform *app)
             vkFreeMemory(app->device, app->swarms[i].triangle_memory, NULL);
         }
         free(app->swarms);
+        free(app->ant_animations);
         vkDestroyDescriptorPool(app->device, app->descriptor_pool, NULL);
         vkDestroyDescriptorSetLayout(app->device, app->transform_descriptor_layout, NULL);
         vkDestroyBuffer(app->device, app->instance_buffer, NULL);
@@ -962,6 +965,18 @@ void platform_poll_input(Platform *app, Input *input)
              event.window.event == SDL_WINDOWEVENT_RESIZED))
             app->framebuffer_resized = 1;
     }
+
+    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+    input->pitch_up = keys[SDL_SCANCODE_W];
+    input->pitch_down = keys[SDL_SCANCODE_S];
+    input->yaw_left = keys[SDL_SCANCODE_A];
+    input->yaw_right = keys[SDL_SCANCODE_D];
+    input->roll_left = keys[SDL_SCANCODE_E];
+    input->roll_right = keys[SDL_SCANCODE_Q];
+    input->translate_forward = keys[SDL_SCANCODE_UP];
+    input->translate_backward = keys[SDL_SCANCODE_DOWN];
+    input->translate_left = keys[SDL_SCANCODE_LEFT];
+    input->translate_right = keys[SDL_SCANCODE_RIGHT];
 
     int mouse_x, mouse_y, window_width, window_height;
     SDL_GetMouseState(&mouse_x, &mouse_y);

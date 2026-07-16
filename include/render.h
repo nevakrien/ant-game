@@ -10,6 +10,9 @@
 typedef uint32_t MeshHandle;
 typedef uint32_t ModelHandle;
 typedef uint32_t TransformHandle;
+typedef uint32_t AntAnimationHandle;
+
+#define ANT_WORLD_PLANE_TRANSFORM UINT32_MAX
 
 typedef struct Model {
     MeshHandle mesh_handle;
@@ -37,6 +40,20 @@ typedef struct Ant {
     float tangent[3];
 } Ant;
 
+typedef struct AntPlane {
+    /* Use ANT_WORLD_PLANE_TRANSFORM for a plane already expressed in world space. */
+    TransformHandle transform_handle;
+    float position[3];
+    float normal[3];
+    float forward[3];
+} AntPlane;
+
+typedef enum AntAnimationStatus {
+    ANT_ANIMATION_PENDING,
+    ANT_ANIMATION_RUNNING,
+    ANT_ANIMATION_FINISHED
+} AntAnimationStatus;
+
 int render_add_mesh(Platform *platform, const ObjectMesh *mesh, MeshHandle *mesh_handle);
 int render_update_mesh(Platform *platform, MeshHandle mesh_handle, const ObjectMesh *mesh);
 int render_add_model(Platform *platform, const Model *model, ModelHandle *model_handle);
@@ -49,6 +66,13 @@ int render_add_drawable(Platform *platform, ModelHandle model_handle,
 int render_add_antable(Platform *platform, TransformHandle surface_transform,
                        const ObjectNavMesh *navmesh, const Ant *ants,
                        size_t ant_count);
+int render_animate_ant_between_planes(Platform *platform, TransformHandle ant_transform,
+                                      const AntPlane *source, const AntPlane *destination,
+                                      float duration_seconds, float jump_height,
+                                      AntAnimationHandle *animation_handle);
+int render_get_ant_animation_status(const Platform *platform,
+                                    AntAnimationHandle animation_handle,
+                                    AntAnimationStatus *status);
 void render_step_ants(Platform *platform, float delta_seconds);
 int render_draw(Platform *platform, const Scene *scene);
 

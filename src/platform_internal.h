@@ -62,6 +62,17 @@ typedef struct AntSwarm {
     TransformHandle surface_transform;
 } AntSwarm;
 
+typedef struct AntAnimation {
+    TransformHandle ant_transform;
+    AntPlane source;
+    AntPlane destination;
+    float duration_seconds;
+    float jump_height;
+    float elapsed_seconds;
+    AntAnimationStatus status;
+    int holds_transform;
+} AntAnimation;
+
 typedef struct PushConstants {
     float view_projection[16];
     float light_direction[4];
@@ -132,6 +143,9 @@ struct Platform {
     AntSwarm *swarms;
     size_t swarm_count;
     size_t swarm_capacity;
+    AntAnimation *ant_animations;
+    size_t ant_animation_count;
+    size_t ant_animation_capacity;
     float swarm_delta_seconds;
     int ants_need_dispatch;
     VkCommandPool command_pool;
@@ -146,5 +160,6 @@ int render_build_ant_buffers(Platform *platform, TransformHandle surface_transfo
                              const ObjectNavMesh *navmesh, const Ant *ants,
                              size_t ant_count, uint32_t triangle_count,
                              GpuTriangle **triangles, GpuAnt **gpu_ants);
+int render_update_ant_animations(Platform *platform, float delta_seconds);
 
 #endif
