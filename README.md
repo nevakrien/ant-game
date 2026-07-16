@@ -24,9 +24,12 @@ cmake --build build
 ./build/vulkan_teapot
 ```
 
-Pass another OBJ as the first argument to render a Blender export:
+Pass another OBJ as the first argument to render a Blender export. Generate its
+navmesh once with `navmesh_tool`; the game loads the sibling `.nav` file and
+does not calculate navmeshes during startup:
 
 ```sh
+./build/navmesh_tool path/to/model.obj path/to/model.nav
 ./build/vulkan_teapot path/to/model.obj
 ```
 
@@ -78,6 +81,10 @@ array in a versioned `.nav` file:
 ```sh
 ./build/navmesh_tool path/to/navigation.obj path/to/navigation.nav
 ```
+
+The normal build runs this conversion for `assets/teapot.obj`, producing
+`build/assets/teapot.nav`. CMake regenerates it only when the source OBJ or
+converter changes; the game only loads the generated binary at startup.
 
 Load the result with `object_navmesh_load_file()` and release it with
 `object_navmesh_destroy()`. `ObjectNavMesh.neighbors` has three entries per

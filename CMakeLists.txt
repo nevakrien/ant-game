@@ -14,6 +14,8 @@ include(CTest)
 
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
+set(NAVMESH_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/assets")
+file(MAKE_DIRECTORY "${NAVMESH_OUTPUT_DIR}")
 
 foreach(shader object.vert object.frag ant.comp)
     add_custom_command(
@@ -35,16 +37,27 @@ target_link_libraries(object_mesh PUBLIC m)
 add_executable(navmesh_tool src/navmesh_cli.c)
 target_link_libraries(navmesh_tool PRIVATE object_mesh)
 
+set(DEFAULT_NAVMESH_PATH "${NAVMESH_OUTPUT_DIR}/teapot.nav")
+add_custom_command(
+    OUTPUT "${DEFAULT_NAVMESH_PATH}"
+    COMMAND $<TARGET_FILE:navmesh_tool>
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj"
+            "${DEFAULT_NAVMESH_PATH}"
+    DEPENDS navmesh_tool "${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj"
+    VERBATIM)
+add_custom_target(object_navmeshes DEPENDS "${DEFAULT_NAVMESH_PATH}")
+
 add_executable(vulkan_teapot
     src/main.c
     src/app.c
     src/render.c
     src/platform.c)
-add_dependencies(vulkan_teapot object_shaders)
+add_dependencies(vulkan_teapot object_shaders object_navmeshes)
 target_include_directories(vulkan_teapot PRIVATE include)
 target_compile_definitions(vulkan_teapot PRIVATE
     OBJECT_SHADER_DIR="${SHADER_OUTPUT_DIR}"
-    DEFAULT_OBJECT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj")
+    DEFAULT_OBJECT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/teapot.obj"
+    DEFAULT_NAVMESH_PATH="${DEFAULT_NAVMESH_PATH}")
 target_link_libraries(vulkan_teapot PRIVATE
     object_mesh Vulkan::Vulkan PkgConfig::SDL2)
 
