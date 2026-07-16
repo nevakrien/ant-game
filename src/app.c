@@ -71,17 +71,31 @@ static void mat4_multiply(float out[16], const float a[16], const float b[16])
     memcpy(out, result, sizeof(result));
 }
 
+// static void mat4_perspective(float m[16], float aspect)
+// {
+//     const float near_plane = 0.1f, far_plane = 200.0f;
+//     const float f = 1.0f / tanf(45.0f * 3.14159265f / 360.0f);
+//     memset(m, 0, sizeof(float) * 16);
+//     m[0] = f / aspect;
+//     m[5] = f;
+//     m[10] = far_plane / (near_plane - far_plane);
+//     m[11] = -1.0f;
+//     m[14] = (far_plane * near_plane) / (near_plane - far_plane);
+// }
+
+
 static void mat4_perspective(float m[16], float aspect)
 {
-    const float near_plane = 0.1f, far_plane = 20.0f;
+    const float near_plane = 1.0f;
     const float f = 1.0f / tanf(45.0f * 3.14159265f / 360.0f);
     memset(m, 0, sizeof(float) * 16);
     m[0] = f / aspect;
     m[5] = f;
-    m[10] = far_plane / (near_plane - far_plane);
+    m[10] = -1.0f;
     m[11] = -1.0f;
-    m[14] = (far_plane * near_plane) / (near_plane - far_plane);
+    m[14] = -near_plane;
 }
+
 
 static void mat4_view(float m[16], const float eye[3], const float rotation[3])
 {
